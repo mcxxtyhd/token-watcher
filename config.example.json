@@ -1,0 +1,35 @@
+{
+  "primary": "volcengine",
+  "poll_interval_sec": 300,
+  "warning_percent": 80,
+  "critical_percent": 95,
+  "theme": "dark",
+  "providers": [
+    {
+      "id": "volcengine",
+      "type": "volcengine",
+      "label": "火山方舟-coding plan",
+      "credentials": {
+        "cookie": "PASTE_YOUR_FULL_COOKIE_STRING_HERE",
+        "csrf_token": "PASTE_CSRF_TOKEN_HERE",
+        "x_web_id": "PASTE_X_WEB_ID_HERE"
+      }
+    },
+    {
+      "id": "minimax",
+      "type": "minimax",
+      "label": "MiniMax",
+      "credentials": {
+        "api_key": "PASTE_YOUR_MINIMAX_API_KEY_HERE"
+      }
+    },
+    {
+      "id": "deepseek",
+      "type": "deepseek",
+      "label": "DeepSeek",
+      "credentials": {
+        "api_key": "PASTE_YOUR_DEEPSEEK_API_KEY_HERE"
+      }
+    }
+  ]
+}
