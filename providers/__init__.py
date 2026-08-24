@@ -11,6 +11,7 @@ from .base import (
 from . import volcengine  # noqa: F401  registers "volcengine"
 from . import minimax  # noqa: F401  registers "minimax"
 from . import deepseek  # noqa: F401  registers "deepseek"
+from . import qoder  # noqa: F401  registers "qoder"
 
 __all__ = [
     "ProviderBase",
