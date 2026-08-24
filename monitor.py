@@ -166,6 +166,11 @@ def percent_color(p: float, warn: float, crit: float) -> QColor:
     return QColor("#2ecc71")
 
 
+def _fmt_pct(v: float) -> str:
+    """Integer percent if value is whole, else two decimals."""
+    return f"{int(v)}%" if v == int(v) else f"{v:.2f}%"
+
+
 def _default_label_for(ptype: str) -> str:
     """Stable default display name for a provider type.
 
@@ -178,6 +183,7 @@ def _default_label_for(ptype: str) -> str:
         "volcengine": "字节模型",
         "minimax": "MiniMax",
         "deepseek": "DeepSeek",
+        "qoder": "Qoder",
     }
     count = sum(
         1 for p in _app_config.get("providers", [])
@@ -406,10 +412,10 @@ class FloatBall(QWidget):
             painter.drawArc(ring_rect, 90 * 16, -arc)
 
             painter.setPen(ball_text)
-            painter.setFont(QFont("Segoe UI", 17, QFont.Weight.Bold))
+            painter.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
             painter.drawText(
                 QRect(0, 24, BALL_SIZE, 22),
-                Qt.AlignmentFlag.AlignCenter, f"{q.used_percent:.0f}%",
+                Qt.AlignmentFlag.AlignCenter, _fmt_pct(q.used_percent),
             )
 
         # Label line.
@@ -600,7 +606,7 @@ def _make_provider_card(snap: ProviderSnapshot, is_primary: bool,
                     f"color: {th.card_subtext}; font-size: 11px; background: transparent;"
                 )
                 right = QLabel(
-                    f"{q.used_percent:.1f}%  剩{q.remaining_percent:.0f}%"
+                    f"{_fmt_pct(q.used_percent)}  剩{_fmt_pct(q.remaining_percent)}"
                 )
                 right.setStyleSheet(
                     f"color: {th.card_subtext}; font-size: 10px; background: transparent;"
@@ -899,7 +905,8 @@ class SettingsDialog(QDialog):
         sl.addWidget(add_hint)
         self.type_combo = QComboBox()
         from providers import PROVIDER_REGISTRY
-        _type_labels = {"volcengine": "火山方舟-coding plan", "minimax": "MiniMax", "deepseek": "DeepSeek"}
+        _type_labels = {"volcengine": "火山方舟-coding plan", "minimax": "MiniMax",
+                        "deepseek": "DeepSeek", "qoder": "Qoder"}
         for tname, cls in PROVIDER_REGISTRY.items():
             self.type_combo.addItem(_type_labels.get(tname, tname), tname)
         # Combo + 添加 button on the same row (saves vertical space and reads
@@ -1051,12 +1058,32 @@ class SettingsDialog(QDialog):
         ]))
         v.addWidget(self.key_frame)
 
+        # Qoder: no credential fields - login happens in a browser window
+        # (session cookie lives in the dedicated Chrome profile). Hidden for
+        # other types.
+        self.qoder_frame = QFrame()
+        qoder_layout = QVBoxLayout(self.qoder_frame)
+        qoder_layout.setContentsMargins(0, 0, 0, 0)
+        qoder_layout.setSpacing(10)
+        qoder_hint = QLabel(
+            "无需粘贴凭证：点击下方按钮打开 Qoder 登录页，在浏览器中登录一次即可。\n"
+            "登录态保存在本地专用浏览器配置中，约 8 天过期后重新登录。"
+        )
+        qoder_hint.setObjectName("pageSub")
+        qoder_hint.setWordWrap(True)
+        qoder_layout.addWidget(qoder_hint)
+        self.qoder_login_btn = QPushButton("打开 Qoder 登录窗口")
+        self.qoder_login_btn.clicked.connect(self._open_qoder_login)
+        qoder_layout.addWidget(self.qoder_login_btn)
+        v.addWidget(self.qoder_frame)
+
         v.addStretch()
         # Initial state: hide the entire right pane (info + credential frames).
         # Only shown after the user clicks a provider on the left.
         self.info_frame.hide()
         self.volc_frame.hide()
         self.key_frame.hide()
+        self.qoder_frame.hide()
 
     def _build_appearance_page(self, page):
         v = QVBoxLayout(page)
@@ -1139,7 +1166,7 @@ class SettingsDialog(QDialog):
 
         info_lines = [
             ("版本", "1.0.0"),
-            ("Providers", "火山方舟-coding plan / MiniMax / DeepSeek"),
+            ("Providers", "火山方舟-coding plan / MiniMax / DeepSeek / Qoder"),
             ("技术栈", "Python 3.14 + PySide6"),
         ]
         for label, value in info_lines:
@@ -1294,6 +1321,7 @@ class SettingsDialog(QDialog):
         if ptype == "volcengine":
             self.volc_frame.show()
             self.key_frame.hide()
+            self.qoder_frame.hide()
             # Prefer the original cURL when present -- that's the only form
             # from which x_web_id can be re-extracted (the bare cookie
             # doesn't carry it). Fall back to the cleaned cookie for legacy
@@ -1304,13 +1332,27 @@ class SettingsDialog(QDialog):
             self.csrf_edit.setText(c.get("csrf_token", ""))
             self.xwebid_edit.setText(c.get("x_web_id", ""))
             self.apikey_edit.setText("")
+        elif ptype == "qoder":
+            self.volc_frame.hide()
+            self.key_frame.hide()
+            self.qoder_frame.show()
         else:
             self.volc_frame.hide()
             self.key_frame.show()
+            self.qoder_frame.hide()
             self.apikey_edit.setText(c.get("api_key", ""))
             self.cred_cookie.setPlainText("")
             self.csrf_edit.setText("")
             self.xwebid_edit.setText("")
+
+    def _open_qoder_login(self):
+        """Open a visible browser window for (re)login to qoder.com."""
+        from providers.qoder import open_login_window
+
+        try:
+            open_login_window()
+        except Exception as e:
+            QMessageBox.warning(self, "提示", f"打开登录窗口失败: {e}")
 
     def _parse_curl(self):
         parsed = _parse_curl_or_cookie(self.cred_cookie.toPlainText())
@@ -1431,6 +1473,13 @@ class SettingsDialog(QDialog):
                 "x_web_id": self.xwebid_edit.text().strip(),
                 "original_curl": original_curl,
             }
+        elif ptype == "qoder":
+            # No user-entered credentials: login state lives in the dedicated
+            # Chrome profile. Keep cdp_port if the user set one.
+            p["credentials"] = {
+                k: v for k, v in p.get("credentials", {}).items()
+                if k == "cdp_port"
+            }
         else:
             p["credentials"] = {
                 "api_key": self.apikey_edit.text().strip(),
@@ -1527,9 +1576,11 @@ class SettingsDialog(QDialog):
                 return False
             return True
         # MiniMax / DeepSeek: api_key is the only required credential.
-        if not self.apikey_edit.text().strip():
-            QMessageBox.warning(self, "提示", "API Key 不能为空")
-            return False
+        if ptype not in ("volcengine", "qoder"):
+            if not self.apikey_edit.text().strip():
+                QMessageBox.warning(self, "提示", "API Key 不能为空")
+                return False
+        # Qoder: no required fields (browser-login based).
         return True
 
     def accept(self):
