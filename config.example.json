@@ -1,6 +1,6 @@
 {
   "primary": "volcengine",
-  "poll_interval_sec": 300,
+  "poll_interval_sec": 10,
   "warning_percent": 80,
   "critical_percent": 95,
   "theme": "dark",

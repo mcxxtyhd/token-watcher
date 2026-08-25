@@ -104,7 +104,7 @@ Qoder 没有 API key 机制，额度查询依赖浏览器里的加密登录 cook
 
 ### 方式一：下载现成的 exe（推荐，无需装任何东西）
 
-去本项目的 [Releases 页面](../../releases)，下载 `CodingPlanMonitor.exe`，双击就能跑。
+去本项目的 [Releases 页面](../../releases)，下载 `tokenWatch.exe`，双击就能跑。
 
 第一次用：在 exe 同目录放一个 `config.json` 文件写你的配置（可以从仓库的 `config.example.json` 复制改名）。之后程序会记住配置，直接双击 exe 启动即可。
 

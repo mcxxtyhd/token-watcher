@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, QPoint, QRect, Signal, QSize
+from PySide6.QtCore import Qt, QTimer, QPoint, QRect, Signal, QSize, QThread
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -189,8 +189,38 @@ def _default_label_for(ptype: str) -> str:
         1 for p in _app_config.get("providers", [])
         if p.get("type") == ptype
     )
-    prefix = prefix_map.get(ptype, ptype or "Provider")
+    prefix = prefix_map.get(ptype, ptype or "平台")
     return f"{prefix}-{count}"
+
+
+def _auto_labels() -> dict:
+    """{provider_id: display_label} for every configured provider.
+
+    Counts same-type providers up to and including this one, saved or not,
+    so the Nth provider of a type is always `<prefix>-N` unless the user
+    explicitly renamed it. Stable: list order is preserved, labels don't
+    shift on reload, and adding a fresh provider never collides with a
+    saved sibling because the saved label takes precedence over the
+    auto-generated one for that same slot.
+    """
+    prefix_map = {
+        "volcengine": "字节模型",
+        "minimax": "MiniMax",
+        "deepseek": "DeepSeek",
+        "qoder": "Qoder",
+    }
+    counts: dict = {}
+    out: dict = {}
+    for p in _app_config.get("providers", []):
+        ptype = p.get("type", "")
+        counts[ptype] = counts.get(ptype, 0) + 1
+        saved = p.get("label", "")
+        if saved:
+            out[p["id"]] = saved
+        else:
+            prefix = prefix_map.get(ptype, ptype or "平台")
+            out[p["id"]] = f"{prefix}-{counts[ptype]}"
+    return out
 
 
 def _parse_curl_or_cookie(text: str) -> dict:
@@ -250,14 +280,14 @@ def _parse_curl_or_cookie(text: str) -> dict:
 def load_config() -> dict:
     """Load config.json, migrating the old single-provider format if needed."""
     if not CONFIG_PATH.exists():
-        return {"primary": "", "providers": [], "poll_interval_sec": 300,
+        return {"primary": "", "providers": [], "poll_interval_sec": 10,
                 "warning_percent": 80, "critical_percent": 95}
     cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     # Old format had top-level "cookie" / "csrf_token" -> migrate.
     if "providers" not in cfg and "cookie" in cfg:
         cfg = {
             "primary": "volcengine",
-            "poll_interval_sec": cfg.get("poll_interval_sec", 300),
+            "poll_interval_sec": cfg.get("poll_interval_sec", 10),
             "warning_percent": cfg.get("warning_percent", 80),
             "critical_percent": cfg.get("critical_percent", 95),
             "providers": [
@@ -275,7 +305,7 @@ def load_config() -> dict:
         }
     cfg.setdefault("primary", cfg["providers"][0]["id"] if cfg.get("providers") else "")
     cfg.setdefault("providers", [])
-    cfg.setdefault("poll_interval_sec", 300)
+    cfg.setdefault("poll_interval_sec", 10)
     cfg.setdefault("warning_percent", 80)
     cfg.setdefault("critical_percent", 95)
     cfg.setdefault("theme", "dark")
@@ -748,15 +778,40 @@ class DetailCard(QWidget):
 
 
 def _provider_label(pid: str) -> str:
-    for p in _app_config.get("providers", []):
-        if p["id"] == pid:
-            return p.get("label") or _default_label_for(p.get("type", ""))
-    return pid
+    return _auto_labels().get(pid, pid)
 
 
 # ---------------------------------------------------------------------------
 # Settings dialog (multi-provider)
 # ---------------------------------------------------------------------------
+
+class _QoderCookieProbe(QThread):
+    """Single-shot, non-intrusive: ask Chrome if the qoder session cookie
+    is present. Reuses the user's existing tab via Network.getCookies -- no
+    new tab, no navigation, no focus theft. Takes ~50 ms.
+
+    Polled every 3 s after the user clicks "打开 Qoder 登录窗口" so the
+    settings dialog's status line flips to ✓ as soon as login completes.
+    """
+
+    ok = Signal()
+    fail = Signal(str)
+
+    def __init__(self, port: int, parent=None):
+        super().__init__(parent)
+        self._port = port
+
+    def run(self) -> None:
+        from providers.qoder import QoderCdp
+
+        try:
+            if QoderCdp(self._port).has_session_cookie():
+                self.ok.emit()
+            else:
+                self.fail.emit("no cookie")
+        except Exception as e:
+            self.fail.emit(str(e))
+
 
 class SettingsDialog(QDialog):
     theme_changed = Signal()
@@ -921,10 +976,10 @@ class SettingsDialog(QDialog):
         sl.addLayout(add_row)
 
         sl.addSpacing(12)
-        sl.addWidget(self._navgroup("GENERAL"))
+        sl.addWidget(self._navgroup("通用"))
         # Nav buttons (checkable for active-state styling).
         self._nav_btns: list[QPushButton] = []
-        for label, page_idx in [("Appearance", 1), ("About", 2)]:
+        for label, page_idx in [("外观", 1), ("关于", 2)]:
             btn = QPushButton(label)
             btn.setCheckable(True)
             btn.setStyleSheet(
@@ -1072,10 +1127,23 @@ class SettingsDialog(QDialog):
         qoder_hint.setObjectName("pageSub")
         qoder_hint.setWordWrap(True)
         qoder_layout.addWidget(qoder_hint)
+        self.qoder_status_label = QLabel()
+        self.qoder_status_label.setObjectName("qoderStatus")
+        self.qoder_status_label.setWordWrap(True)
+        self._set_qoder_status("no_login")
+        qoder_layout.addWidget(self.qoder_status_label)
         self.qoder_login_btn = QPushButton("打开 Qoder 登录窗口")
         self.qoder_login_btn.clicked.connect(self._open_qoder_login)
         qoder_layout.addWidget(self.qoder_login_btn)
         v.addWidget(self.qoder_frame)
+
+        # Polling state -- set when "打开 Qoder 登录窗口" is clicked; cleared
+        # once a probe confirms login success or the 90 s deadline elapses.
+        self._qoder_poll = QTimer(self)
+        self._qoder_poll.setInterval(1000)
+        self._qoder_poll.timeout.connect(self._poll_qoder_login)
+        self._qoder_probe_attempts = 0
+        self._qoder_probes: list = []  # keep refs so QThreads aren't GC'd
 
         v.addStretch()
         # Initial state: hide the entire right pane (info + credential frames).
@@ -1090,7 +1158,7 @@ class SettingsDialog(QDialog):
         v.setContentsMargins(28, 20, 28, 20)
         v.setSpacing(14)
         page.setStyleSheet(f"background: {self._c_bg};")
-        title = QLabel("Appearance")
+        title = QLabel("外观")
         title.setObjectName("pageTitle")
         v.addWidget(title)
         sub = QLabel("配置主题与显示偏好")
@@ -1112,7 +1180,7 @@ class SettingsDialog(QDialog):
 
         prim_row = QHBoxLayout()
         prim_row.setSpacing(12)
-        lbl2 = QLabel("主 Provider")
+        lbl2 = QLabel("主平台")
         lbl2.setObjectName("fieldLabel")
         lbl2.setMinimumWidth(100)
         prim_row.addWidget(lbl2)
@@ -1157,17 +1225,12 @@ class SettingsDialog(QDialog):
         v.setContentsMargins(28, 20, 28, 20)
         v.setSpacing(14)
         page.setStyleSheet(f"background: {self._c_bg};")
-        title = QLabel("About")
+        title = QLabel("关于")
         title.setObjectName("pageTitle")
         v.addWidget(title)
-        sub = QLabel("Coding Plan Monitor")
-        sub.setObjectName("pageSub")
-        v.addWidget(sub)
 
         info_lines = [
-            ("版本", "1.0.0"),
-            ("Providers", "火山方舟-coding plan / MiniMax / DeepSeek / Qoder"),
-            ("技术栈", "Python 3.14 + PySide6"),
+            ("版本", "0.1.1"),
         ]
         for label, value in info_lines:
             row = QHBoxLayout()
@@ -1243,7 +1306,7 @@ class SettingsDialog(QDialog):
             rh = QHBoxLayout(row_widget)
             rh.setContentsMargins(12, 4, 8, 4)
             rh.setSpacing(6)
-            lbl = QLabel(p.get("label") or _default_label_for(p.get("type", "")))
+            lbl = QLabel(_auto_labels().get(p["id"], p.get("label", "")))
             lbl.setObjectName("navItem")
             lbl.setStyleSheet("background: transparent;")
             rh.addWidget(lbl)
@@ -1269,7 +1332,7 @@ class SettingsDialog(QDialog):
         self.primary_combo.clear()
         for p in _app_config.get("providers", []):
             self.primary_combo.addItem(
-                p.get("label") or _default_label_for(p.get("type", "")), p["id"]
+                _auto_labels().get(p["id"], p.get("label", "")), p["id"]
             )
         cur = _app_config.get("primary", "")
         idx = self.primary_combo.findData(cur)
@@ -1280,7 +1343,7 @@ class SettingsDialog(QDialog):
         if tidx >= 0:
             self.theme_combo.setCurrentIndex(tidx)
         self.theme_combo.blockSignals(False)
-        iidx = self.interval_combo.findData(_app_config.get("poll_interval_sec", 300))
+        iidx = self.interval_combo.findData(_app_config.get("poll_interval_sec", 10))
         if iidx >= 0:
             self.interval_combo.setCurrentIndex(iidx)
         widx = self.warn_combo.findData(int(_app_config.get("warning_percent", 80)))
@@ -1311,10 +1374,10 @@ class SettingsDialog(QDialog):
         # Auto-fill the label if empty so the user always sees a sensible
         # name (and can edit it). The underlying entry stays label="" until
         # commit so we don't persist auto-names the user immediately overrides.
-        label = p.get("label", "") or _default_label_for(ptype)
+        label = p.get("label", "") or _auto_labels().get(p["id"], _default_label_for(ptype))
         self.info_frame.show()
         self.prov_title.setText(label)
-        self.prov_sub.setText(f"{ptype}  {'· 主 Provider' if is_primary else ''}")
+        self.prov_sub.setText(f"{ptype}  {'· 主平台' if is_primary else ''}")
         self.label_edit.setText(label)
         c = p.get("credentials", {})
         # Show only relevant credential fields based on provider type.
@@ -1336,6 +1399,8 @@ class SettingsDialog(QDialog):
             self.volc_frame.hide()
             self.key_frame.hide()
             self.qoder_frame.show()
+            self._qoder_probe_attempts = 0
+            self._qoder_probe_async(int(c.get("cdp_port", 9333)))
         else:
             self.volc_frame.hide()
             self.key_frame.show()
@@ -1353,6 +1418,72 @@ class SettingsDialog(QDialog):
             open_login_window()
         except Exception as e:
             QMessageBox.warning(self, "提示", f"打开登录窗口失败: {e}")
+            return
+        self._set_qoder_status("waiting")
+        self._qoder_probe_attempts = 0
+        self._qoder_probes.clear()
+        self._qoder_poll.start()
+
+    def _set_qoder_status(self, state: str) -> None:
+        """Update the status line. state in: no_login / waiting / logged_in / timeout."""
+        states = {
+            "no_login": ("⚠ 暂无登录信息,请点击下方按钮打开 Qoder 登录窗口", "#f39c12"),
+            "waiting": ("⏳ 已打开登录窗口,请在其中完成登录(检测中…)", "#3b8bff"),
+            "logged_in": ("✓ 登录成功,数据将在下次轮询时刷新", "#2ecc71"),
+            "timeout": ("⚠ 未检测到登录完成,请重试", "#e74c3c"),
+        }
+        text, color = states[state]
+        self.qoder_status_label.setText(text)
+        self.qoder_status_label.setStyleSheet(
+            f"color: {color}; font-size: 12px; font-weight: 600; background: transparent;"
+        )
+
+    def _qoder_probe_async(self, port: int) -> None:
+        """Run a single non-blocking cookie check to determine login state.
+
+        Uses Network.getCookies (not fetch()) so we don't open a new tab or
+        navigate to qoder.com -- both of those pop the user's login window
+        to the foreground on every poll tick.
+        """
+        probe = _QoderCookieProbe(port, self)
+        probe.ok.connect(self._on_qoder_probe_ok)
+        probe.fail.connect(self._on_qoder_probe_fail)
+        probe.finished.connect(probe.deleteLater)
+        self._qoder_probes.append(probe)
+        probe.start()
+
+    def _poll_qoder_login(self) -> None:
+        """Timer tick: launch a probe, stop polling on success or timeout."""
+        self._qoder_probe_attempts += 1
+        if self._qoder_probe_attempts > 90:  # 90 × 1s = 90s
+            self._qoder_poll.stop()
+            self._set_qoder_status("timeout")
+            return
+        port = self._current_qoder_port()
+        if port is None:
+            return
+        self._qoder_probe_async(port)
+
+    def _on_qoder_probe_ok(self) -> None:
+        self._qoder_poll.stop()
+        self._set_qoder_status("logged_in")
+        # Drop finished probes so they can be GC'd.
+        self._qoder_probes = [p for p in self._qoder_probes if p.isRunning()]
+        # Nudge MainWindow to refresh the ball right now -- otherwise it
+        # would wait up to poll_interval_sec (10 s) before showing data.
+        self.applied.emit()
+
+    def _on_qoder_probe_fail(self, msg: str) -> None:
+        # Keep status at "waiting" -- the user might still be logging in.
+        # Only the 90 s timeout changes the status.
+        self._qoder_probes = [p for p in self._qoder_probes if p.isRunning()]
+
+    def _current_qoder_port(self) -> int | None:
+        """Return the cdp_port of the currently edited qoder provider, if any."""
+        for p in _app_config.get("providers", []):
+            if p.get("type") == "qoder":
+                return int(p.get("credentials", {}).get("cdp_port", 9333))
+        return None
 
     def _parse_curl(self):
         parsed = _parse_curl_or_cookie(self.cred_cookie.toPlainText())
@@ -1400,7 +1531,7 @@ class SettingsDialog(QDialog):
 
     def _del_provider_by_id(self, pid: str):
         if pid == _app_config.get("primary"):
-            QMessageBox.warning(self, "提示", "不能删除当前主 Provider")
+            QMessageBox.warning(self, "提示", "不能删除当前主平台")
             return
         # Confirm before destroying a non-primary provider's config.
         label = next((p.get("label", pid) for p in _app_config["providers"]
@@ -1430,9 +1561,7 @@ class SettingsDialog(QDialog):
         p = _app_config["providers"][self._editing_index]
         # Fall back to a default name when the user clears the field,
         # so we never persist an empty label.
-        p["label"] = self.label_edit.text().strip() or _default_label_for(
-            p.get("type", "")
-        )
+        p["label"] = self.label_edit.text().strip() or _auto_labels().get(p["id"], _default_label_for(p.get("type", "")))
         # Only save credentials relevant to this provider type.
         ptype = p.get("type", "")
         if ptype == "volcengine":
@@ -1501,11 +1630,11 @@ class SettingsDialog(QDialog):
         self._commit_editor()
         _app_config["primary"] = self.primary_combo.currentData() or ""
         _app_config["theme"] = self.theme_combo.currentData() or "dark"
-        _app_config["poll_interval_sec"] = self.interval_combo.currentData() or 300
+        _app_config["poll_interval_sec"] = self.interval_combo.currentData() or 10
         _app_config["warning_percent"] = self.warn_combo.currentData() or 80
         _app_config["critical_percent"] = self.crit_combo.currentData() or 95
         if not _app_config.get("providers"):
-            QMessageBox.warning(self, "提示", "至少需要配置一个 Provider")
+            QMessageBox.warning(self, "提示", "至少需要配置一个平台")
             return False
         if not _app_config.get("primary"):
             _app_config["primary"] = _app_config["providers"][0]["id"]
@@ -1661,6 +1790,7 @@ class MonitorApp:
         _app_config = load_config()
         save_config(_app_config)  # persist migrated form
         self.app = QApplication(sys.argv)
+        self.app.setWindowIcon(QIcon(str(_resource_dir() / "image" / "cpw_icon.ico")))
         self.app.setQuitOnLastWindowClosed(False)
 
         self.providers: dict[str, ProviderBase] = {}
@@ -1694,7 +1824,7 @@ class MonitorApp:
 
         self.timer = QTimer(self.ball)
         self.timer.timeout.connect(self.refresh)
-        self.timer.start(_app_config.get("poll_interval_sec", 300) * 1000)
+        self.timer.start(_app_config.get("poll_interval_sec", 10) * 1000)
 
         self.ball.show()
         screen = self.app.primaryScreen().geometry()
@@ -1832,7 +1962,7 @@ class MonitorApp:
         self.ball.crit = _app_config.get("critical_percent", 95)
         self.ball.refresh_theme()
         self.card.refresh_theme()
-        self.timer.start(_app_config.get("poll_interval_sec", 300) * 1000)
+        self.timer.start(_app_config.get("poll_interval_sec", 10) * 1000)
         self._update_tray_menu()
         self.tray.showMessage("Coding Plan", "设置已保存，正在刷新...",
                               QSystemTrayIcon.MessageIcon.Information, 2000)

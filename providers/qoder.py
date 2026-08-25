@@ -105,6 +105,52 @@ class QoderCdp:
         except requests.RequestException:
             return False
 
+    def has_session_cookie(self) -> bool:
+        """Non-intrusive login check: ask the existing browser (no new tab,
+        no navigation) whether the qoder session cookie is present.
+
+        Called from the settings dialog's poll loop. The whole point of
+        avoiding `fetch()` here is to NOT steal focus from the user's login
+        window -- opening a new tab or navigating to qoder.com both pop the
+        Chrome window to the foreground on Windows.
+        """
+        try:
+            tabs = requests.get(f"{self.base}/json/list", timeout=3).json()
+        except requests.RequestException:
+            return False
+        if not tabs:
+            return False
+        # Reuse the user's existing tab (usually qoder.com/account/usage)
+        # instead of /json/new'ing a new one. About:blank is fine for the
+        # cookie query -- Network.getCookies is origin-scoped, not page-scoped.
+        target = next((t for t in tabs if t.get("type") == "page"), tabs[0])
+        ws_url = target.get("webSocketDebuggerUrl")
+        if not ws_url:
+            return False
+        try:
+            from websockets.sync.client import connect
+        except ImportError:
+            return False
+        try:
+            with connect(ws_url, open_timeout=5, close_timeout=3) as ws:
+                self._send(ws, 1, "Network.enable")
+                self._send(
+                    ws, 2, "Network.getCookies",
+                    urls=["https://qoder.com"],
+                )
+                deadline = time.time() + 5
+                while time.time() < deadline:
+                    msg = json.loads(ws.recv(timeout=5))
+                    if msg.get("id") == 2:
+                        cookies = msg.get("result", {}).get("cookies", [])
+                        return any(
+                            c.get("name") == "qoder_session_cookie"
+                            for c in cookies
+                        )
+        except Exception:
+            return False
+        return False
+
     def spawn(self, headless: bool = True) -> None:
         """Start a dedicated Chrome with the debug port. No-op if alive."""
         if self.is_alive():

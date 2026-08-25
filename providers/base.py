@@ -11,7 +11,7 @@ Config model (config.json `providers` array entries):
       "type": "volcengine",         # selects the provider class
       "label": "火山方舟",          # display name
       "credentials": { ... },       # provider-specific fields
-      "poll_interval_sec": 300,     # optional override
+      "poll_interval_sec": 10,       # optional override
       "warning_percent": 80,
       "critical_percent": 95
     }
