@@ -98,9 +98,13 @@ class QoderCdp:
         self.port = port
         self.base = f"http://127.0.0.1:{port}"
 
-    def is_alive(self) -> bool:
+    def is_alive(self, timeout: float = 2) -> bool:
+        # ``timeout`` param keeps the signature compatible with
+        # volcengine_cdp.close_browser, which polls this with a short
+        # timeout (a refused loopback connection can take seconds to raise
+        # on machines where security software intercepts loopback traffic).
         try:
-            r = requests.get(f"{self.base}/json/version", timeout=3)
+            r = requests.get(f"{self.base}/json/version", timeout=timeout)
             return r.status_code == 200
         except requests.RequestException:
             return False
@@ -351,7 +355,7 @@ class QoderProvider(ProviderBase):
 
         for res in results:
             if res.get("status") == 401:
-                raise RuntimeError("Qoder 登录已过期，请在设置中重新登录")
+                raise RuntimeError("Qoder 登录已过期,请在设置中重新登录")
 
         v2 = results[0].get("body") or {}
         v1 = (results[1].get("body") or {}) if len(results) > 1 else {}

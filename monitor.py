@@ -11,12 +11,14 @@ Providers are pluggable (see providers/). Adding one = write a subclass.
 from __future__ import annotations
 
 import json
+import logging
 import sys
 import time
+
 from dataclasses import dataclass
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, QPoint, QRect, Signal, QSize, QThread
+from PySide6.QtCore import Qt, QTimer, QPoint, QRect, Signal, QSize, QThread, QPropertyAnimation, QEasingCurve
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -60,6 +62,37 @@ from PySide6.QtWidgets import (
 
 from providers import build_provider, ProviderSnapshot
 from providers.base import ProviderBase
+from providers.volcengine_cdp import LOGIN_PORT, DEFAULT_PORT
+
+_log = logging.getLogger("monitor")
+if not _log.handlers:
+    _log.setLevel(logging.DEBUG)
+    _h = logging.StreamHandler(sys.stderr)
+    _h.setFormatter(
+        logging.Formatter("[monitor] %(asctime)s.%(msecs)03d "
+                          "%(levelname)-5s %(message)s",
+                          datefmt="%H:%M:%S")
+    )
+    _log.addHandler(_h)
+    # Always-on rotating file log (no env var): UI-flow issues only show up
+    # in real usage, and a log that needs MONITOR_DEBUG=1 set beforehand
+    # never captures the failure the user is reporting.
+    try:
+        from logging.handlers import RotatingFileHandler
+
+        _f = RotatingFileHandler(
+            "monitor_debug.log", maxBytes=500_000, backupCount=2,
+            encoding="utf-8",
+        )
+        _f.setFormatter(
+            logging.Formatter(
+                "%(asctime)s.%(msecs)03d %(levelname)-5s %(message)s",
+                datefmt="%H:%M:%S")
+        )
+        _log.addHandler(_f)
+    except OSError:
+        pass
+_log.propagate = False
 
 BALL_SIZE = 88
 CARD_WIDTH = 300
@@ -355,6 +388,173 @@ class FloatBall(QWidget):
         self._dragged = False
         self._dragging = False
 
+        # --- Edge docking (Xunlei-style "collapse to a tab") ---
+        # When the ball is idle and within _DOCK_PROXIMITY_PX of a screen
+        # edge, it slides mostly off-screen, leaving an _DOCK_TAB_WIDTH
+        # sliver visible. Hovering that sliver pulls it back out. Drag
+        # always disables auto-dock + grants a post-drag grace period.
+        self._docked = False
+        self._dock_edge: str | None = None  # "left" / "right" / "top" / "bottom"
+        self._expanded_pos = self.pos()
+        self._last_interaction_ms = 0
+        self._drag_released_ms = 0
+        self._dock_anim: QPropertyAnimation | None = None
+        self._dock_timer = QTimer(self)
+        self._dock_timer.setInterval(150)
+        self._dock_timer.timeout.connect(self._tick_dock)
+
+    # --- Edge-dock configuration ---
+    _DOCK_PROXIMITY_PX = 6    # ball-edge within this distance of screen edge -> can dock
+    _DOCK_TAB_WIDTH = 10      # visible sliver when docked (px)
+    _DOCK_TAB_TRIGGER_PX = 28 # wider invisible trigger zone so the tab is easy to hit
+    _DOCK_IDLE_MS = 1500      # idle time before auto-dock kicks in
+    _DOCK_POST_DRAG_MS = 2000 # grace period after the user drops the ball
+    _DOCK_ANIM_MS = 220       # slide animation duration
+
+    def start_dock_watch(self):
+        """Begin polling for edge docking. Call once after show()."""
+        self._expanded_pos = self.pos()
+        self._last_interaction_ms = self._now_ms()
+        self._dock_timer.start()
+
+    def stop_dock_watch(self):
+        """Stop the dock poll (e.g. on app quit so the timer doesn't fire
+        into a destroyed widget)."""
+        self._dock_timer.stop()
+        if self._dock_anim is not None:
+            self._dock_anim.stop()
+
+    @staticmethod
+    def _now_ms() -> int:
+        import time as _t
+        return int(_t.monotonic() * 1000)
+
+    def _current_screen_geometry(self) -> QRect | None:
+        """Return the geometry of the screen the ball's CENTER is on.
+        Falls back to the primary screen when the cursor isn't over any
+        known screen (shouldn't happen, but guards against None)."""
+        center = self.pos() + QPoint(BALL_SIZE // 2, BALL_SIZE // 2)
+        scr = QApplication.screenAt(center)
+        if scr is None:
+            scr = QApplication.primaryScreen()
+        return scr.geometry() if scr else None
+
+    def _tick_dock(self):
+        """Poll: maybe dock, maybe undock."""
+        # Bail if a dock/undock animation is already running.
+        if self._dock_anim is not None and self._dock_anim.state() == QPropertyAnimation.State.Running:
+            return
+        if self._dragging:
+            # Always reset idle clock while the user is actively dragging.
+            self._last_interaction_ms = self._now_ms()
+            return
+        now = self._now_ms()
+        # After a drag ends, give the user time to settle before
+        # re-docking (otherwise the ball snaps to the edge the moment
+        # they let go, which feels aggressive).
+        if now - self._drag_released_ms < self._DOCK_POST_DRAG_MS:
+            return
+        sg = self._current_screen_geometry()
+        if sg is None:
+            return
+        # Distance from each edge of the ball to the corresponding edge
+        # of the screen. Negative = the ball is past the edge (clipped).
+        left = self.x() - sg.x()
+        right = (sg.x() + sg.width()) - (self.x() + BALL_SIZE)
+        top = self.y() - sg.y()
+        bottom = (sg.y() + sg.height()) - (self.y() + BALL_SIZE)
+        nearest = min(left, right, top, bottom)
+        edge = ("left" if left == nearest else
+                "right" if right == nearest else
+                "top" if top == nearest else "bottom")
+        if not self._docked:
+            self._maybe_dock(nearest, edge, now)
+        else:
+            self._maybe_undock(edge)
+
+    def _maybe_dock(self, nearest_dist: int, edge: str, now_ms: int):
+        # Idle long enough AND near an edge AND mouse is somewhere other
+        # than on the ball -> collapse.
+        if nearest_dist > self._DOCK_PROXIMITY_PX:
+            return
+        if now_ms - self._last_interaction_ms < self._DOCK_IDLE_MS:
+            return
+        from PySide6.QtGui import QCursor
+        cursor = QCursor.pos()
+        if self.geometry().contains(cursor):
+            return
+        self._expanded_pos = self.pos()
+        self._dock_to_edge(edge)
+
+    def _maybe_undock(self, edge: str):
+        """If the cursor is over the docked tab's trigger zone, undock."""
+        from PySide6.QtGui import QCursor
+        sg = self._current_screen_geometry()
+        if sg is None:
+            return
+        cursor = QCursor.pos()
+        # Build the trigger rect in screen coords. The trigger is
+        # _DOCK_TAB_TRIGGER_PX wide (centered on the visible tab) and
+        # spans the ball's full height, so the user has a generous
+        # landing area even with the visible sliver being tiny.
+        cx = self.x() + BALL_SIZE // 2
+        cy = self.y() + BALL_SIZE // 2
+        if edge in ("left", "right"):
+            trig_w = self._DOCK_TAB_TRIGGER_PX
+            if edge == "left":
+                rx_left, rx_right = sg.x(), sg.x() + trig_w
+            else:
+                rx_left, rx_right = sg.x() + sg.width() - trig_w, sg.x() + sg.width()
+            trig = QRect(rx_left, cy - BALL_SIZE // 2, rx_right - rx_left, BALL_SIZE)
+        else:
+            trig_h = self._DOCK_TAB_TRIGGER_PX
+            if edge == "top":
+                ry_top, ry_bot = sg.y(), sg.y() + trig_h
+            else:
+                ry_top, ry_bot = sg.y() + sg.height() - trig_h, sg.y() + sg.height()
+            trig = QRect(cx - BALL_SIZE // 2, ry_top, BALL_SIZE, ry_bot - ry_top)
+        if trig.contains(cursor):
+            self._undock()
+
+    def _dock_to_edge(self, edge: str):
+        """Animate the ball mostly off-screen along `edge`, leaving a tab."""
+        sg = self._current_screen_geometry()
+        if sg is None:
+            return
+        x, y = self.x(), self.y()
+        if edge == "left":
+            target_x = sg.x() - BALL_SIZE + self._DOCK_TAB_WIDTH
+        elif edge == "right":
+            target_x = sg.x() + sg.width() - self._DOCK_TAB_WIDTH
+        elif edge == "top":
+            target_y = sg.y() - BALL_SIZE + self._DOCK_TAB_WIDTH
+        else:  # bottom
+            target_y = sg.y() + sg.height() - self._DOCK_TAB_WIDTH
+        self._animate_to(QPoint(target_x if edge in ("left", "right") else x,
+                                target_y if edge in ("top", "bottom") else y))
+        self._docked = True
+        self._dock_edge = edge
+        _log.info(f"ball docked to {edge} at {self.pos()} -> target")
+
+    def _undock(self):
+        """Animate back to the last expanded position."""
+        self._animate_to(self._expanded_pos)
+        self._docked = False
+        self._dock_edge = None
+        self._last_interaction_ms = self._now_ms()  # don't re-dock instantly
+        _log.info(f"ball undocked -> {self._expanded_pos}")
+
+    def _animate_to(self, target: QPoint):
+        if self._dock_anim is not None:
+            self._dock_anim.stop()
+        anim = QPropertyAnimation(self, b"pos", self)
+        anim.setDuration(self._DOCK_ANIM_MS)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        anim.setStartValue(self.pos())
+        anim.setEndValue(target)
+        anim.start()
+        self._dock_anim = anim
+
     def refresh_theme(self):
         # repaint() forces immediate synchronous repaint (update() can be
         # suppressed by the graphics effect / event coalescing).
@@ -474,20 +674,36 @@ class FloatBall(QWidget):
         if event.button() == Qt.MouseButton.LeftButton:
             self._drag_offset = event.globalPosition().toPoint() - self.pos()
             self._dragged = False
+            self._last_interaction_ms = self._now_ms()
 
     def mouseMoveEvent(self, event):
+        # Any hover motion over the ball counts as interaction (resets
+        # the idle clock so the ball doesn't dock while the user is
+        # mousing around it).
+        self._last_interaction_ms = self._now_ms()
         if self._drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
             if not self._dragging:
                 self._dragging = True
                 self.drag_started.emit()
             self.move(event.globalPosition().toPoint() - self._drag_offset)
             self._dragged = True
+            # Dragging pulls the ball out of docked state immediately so
+            # the user isn't fighting the auto-dock during positioning.
+            if self._docked:
+                self._docked = False
+                self._dock_edge = None
+            # Track the live position so undock returns to where the
+            # user actually dropped the ball, not where it was before
+            # the previous dock cycle.
+            self._expanded_pos = self.pos()
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             was_drag = self._dragged
             self._drag_offset = None
             self._dragged = False
+            self._drag_released_ms = self._now_ms()
+            self._last_interaction_ms = self._now_ms()
             # Keep _dragging true until next enter so the leave burst is swallowed.
             QTimer.singleShot(0, self._clear_dragging)
             if not was_drag:
@@ -499,12 +715,14 @@ class FloatBall(QWidget):
     def enterEvent(self, event):
         if getattr(self, "_dragging", False):
             return
+        self._last_interaction_ms = self._now_ms()
         self.hovered.emit(True)
         super().enterEvent(event)
 
     def leaveEvent(self, event):
         if getattr(self, "_dragging", False):
             return
+        self._last_interaction_ms = self._now_ms()
         self.hovered.emit(False)
         super().leaveEvent(event)
 
@@ -813,11 +1031,154 @@ class _QoderCookieProbe(QThread):
             self.fail.emit(str(e))
 
 
+class _VolcengineLoginCheck(QThread):
+    """Single-shot login check for volcengine: run the REAL quota API fetch
+    inside an existing console tab (via VolcengineCdp.verify_session).
+
+    Cookie presence alone is NOT trusted here: expired cookies linger in the
+    shared profile, which made the old probe report "登录成功" the instant the
+    login window opened -- the window was then auto-closed before the user
+    could re-login. Only a 200 with quota data counts as logged in.
+
+    When no login window is open (normal settings-dialog probe), the headless
+    polling Chrome on DEFAULT_PORT is the session holder, so we spawn it if
+    needed and verify there.
+
+    Emits ``ok(snapshot_or_none)``: when verify_session returns a valid
+    payload the parsed ProviderSnapshot is forwarded so the dialog can push
+    it directly to the ball, avoiding a redundant headless fetch (~2-3 s
+    saved off the post-login ball-update latency). None means valid session
+    but the parse failed -- caller should fall back to refresh().
+    """
+
+    ok = Signal(object)
+    fail = Signal(str)
+
+    def __init__(self, port: int, provider=None, require_window: bool = False, parent=None):
+        super().__init__(parent)
+        self._port = port
+        # True while polling the login flow: the login window must be open,
+        # so if it's gone the probe fails fast instead of spawning headless
+        # Chrome for a login the user already gave up on.
+        self._require_window = require_window
+        # VolcengineProvider instance used to parse the raw fetch result
+        # into a ProviderSnapshot (so we can hand the data straight to the
+        # ball instead of re-fetching on the headless Chrome).
+        self._provider = provider
+
+    def run(self) -> None:
+        from providers.volcengine_cdp import (
+            DEFAULT_PORT,
+            ProfileBusy,
+            VolcengineCdp,
+            profile_op,
+            session_is_valid,
+        )
+
+        try:
+            cdp = VolcengineCdp(self._port)
+            if self._port == DEFAULT_PORT:
+                # Headless polling Chrome is the session holder: make sure
+                # it's up (no-op when alive) and verify there. A fresh
+                # headless instance only has about:blank, so the check
+                # must be allowed to open a (invisible) tab.
+                with profile_op():
+                    cdp.spawn(headless=True)
+                    res = cdp.verify_session(allow_navigate=True)
+            elif cdp.is_alive():
+                res = cdp.verify_session()
+            elif self._require_window:
+                self.fail.emit("登录窗口已关闭")
+                return
+            else:
+                # No login window open: the headless polling Chrome is the
+                # session holder. spawn() is a no-op when it's already up.
+                cdp = VolcengineCdp(DEFAULT_PORT)
+                with profile_op():
+                    cdp.spawn(headless=True)
+                    res = cdp.verify_session(allow_navigate=True)
+            if session_is_valid(res):
+                # Forward the parsed snapshot if we can -- the dialog will
+                # use it instead of triggering a redundant headless fetch.
+                snap = None
+                if self._provider is not None:
+                    try:
+                        snap = self._provider.parse_result(res)
+                    except Exception as parse_err:
+                        _log.warning(f"probe: parse_result failed, "
+                                     f"caller will fall back to refresh: {parse_err}")
+                self.ok.emit(snap)
+            else:
+                self.fail.emit(f"verify: status={res and res.get('status')}")
+        except ProfileBusy:
+            # A fetch cycle or the login button holds the profile; retry on
+            # the next poll tick instead of failing loudly.
+            self.fail.emit("系统正忙，稍后自动重试")
+        except Exception as e:
+            self.fail.emit(str(e))
+
+
+class _FetchWorker(QThread):
+    """Runs every provider's fetch() off the UI thread.
+
+    CDP-based providers (volcengine / qoder) can block for tens of seconds:
+    spawning headless Chrome (up to 10 s), waiting for page load (up to 30 s),
+    waiting for the in-page fetch (up to 40 s). Running that on the UI thread
+    froze the whole app -- including the modal settings dialog -- whenever a
+    poll coincided with a slow or stuck Chrome.
+
+    Emits ``done`` with {provider_id: ProviderSnapshot} when all providers
+    finished. A provider whose fetch raised LoginWindowOpen (volcengine login
+    window open, user mid-login) is simply omitted: the ball keeps the last
+    good snapshot instead of flashing an error.
+    """
+
+    done = Signal(dict)
+
+    def __init__(self, providers: dict, parent=None):
+        super().__init__(parent)
+        self._providers = providers
+
+    def run(self) -> None:
+        from providers.volcengine_cdp import LoginWindowOpen
+
+        snaps: dict = {}
+        for pid, p in self._providers.items():
+            try:
+                snap = p.fetch()
+                snaps[pid] = snap
+                if snap.ok:
+                    _log.debug(f"fetch {pid}: ok ({len(snap.levels)} levels)")
+                else:
+                    _log.warning(f"fetch {pid}: not ok - {snap.error}")
+            except LoginWindowOpen as e:
+                _log.info(f"fetch {pid}: skipped ({e})")
+            except Exception as e:
+                _log.warning(f"fetch {pid}: exception {type(e).__name__}: {e}")
+                snaps[pid] = ProviderSnapshot(
+                    provider_id=pid, ok=False, error=str(e)
+                )
+        self.done.emit(snaps)
+
+
 class SettingsDialog(QDialog):
     theme_changed = Signal()
     applied = Signal()  # emitted on "保存": persist + take effect WITHOUT closing
+    # Emitted when a provider login completes (qoder / volcengine probe ok).
+    # Deliberately separate from `applied`: a login must refresh the ball
+    # immediately, but must NOT save_config() -- the dialog may be mid-edit
+    # (e.g. the user just deleted a provider to reconfigure), and persisting
+    # that half-edited state on login-success is how a config once ended up
+    # with providers=[] and primary='' on disk.
+    login_completed = Signal()
+    # Emitted from reject() AFTER _app_config has been rolled back to the
+    # pre-dialog snapshot. MainWindow listens to rebuild self.providers and
+    # refresh the ball so the rolled-back state takes effect immediately
+    # (otherwise the user sees the half-edited provider still being polled
+    # even after cancelling).
+    cancelled = Signal()
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, initial_login: dict[str, bool] | None = None):
         super().__init__(parent)
         self.setWindowTitle("Coding Plan 监控 - 设置")
         self.setModal(True)
@@ -825,6 +1186,19 @@ class SettingsDialog(QDialog):
         self.setMinimumSize(1100, 800)
         self._editing_index: int | None = None
         self._original_theme = _app_config.get("theme", "dark")
+        # Per-provider login state seeded from the current ball snapshots.
+        # Avoids the "暂无登录信息" -> "登录成功" flash on dialog open when
+        # the user is already logged in. Keyed by provider id; providers
+        # missing from the dict default to not-logged-in.
+        self._initial_login = dict(initial_login or {})
+        # Snapshot of _app_config at dialog-open time. Captures the exact
+        # state we should restore to on cancel/close so unsaved adds,
+        # deletes, label edits, primary changes, and theme tweaks all roll
+        # back atomically. Without this, closing with X/取消 after editing
+        # leaked the in-memory mutations to the next dialog open (because
+        # _app_config is module-level and never reverted).
+        import copy as _copy
+        self._saved_config_snapshot = _copy.deepcopy(_app_config)
         self._apply_theme_style()
         self._build()
 
@@ -1077,28 +1451,55 @@ class SettingsDialog(QDialog):
         ]))
         v.addWidget(self.info_frame)
 
-        # Volcengine-specific fields (cURL/cookie/csrf/x_web_id) - hidden for other types.
+        # Volcengine-specific fields - hidden for other types.
+        # Same flow as qoder: no user-typed credentials. Click 登录字节 ->
+        # visible Chrome on console.volcengine.com/coding-plan -> user logs
+        # in -> CDP captures cookie + csrf_token + x_web_id from the
+        # GetCodingPlanUsage request the page fires.
         self.volc_frame = QFrame()
         volc_layout = QVBoxLayout(self.volc_frame)
         volc_layout.setContentsMargins(0, 0, 0, 0)
         volc_layout.setSpacing(10)
-        self.cred_cookie = QTextEdit()
-        self.cred_cookie.setAcceptRichText(False)
-        self.cred_cookie.setPlaceholderText("粘整段 cURL 或 cookie 字符串...")
-        self.cred_cookie.setFixedHeight(180)
-        volc_layout.addWidget(self._card("火山方舟凭证", [
-            ("cURL / Cookie", self.cred_cookie),
-        ]))
-        self.parse_btn = QPushButton("从上方解析 csrf_token / x_web_id")
-        self.parse_btn.clicked.connect(self._parse_curl)
-        volc_layout.addWidget(self.parse_btn)
-        self.csrf_edit = QLineEdit()
-        self.xwebid_edit = QLineEdit()
-        volc_layout.addWidget(self._card("Token", [
-            ("csrf_token", self.csrf_edit),
-            ("x_web_id", self.xwebid_edit),
-        ]))
+        volc_hint = QLabel(
+            "无需粘贴凭证:点击下方按钮打开火山方舟 Coding Plan 登录页,"
+            "在浏览器中登录一次即可。\n"
+            "登录态保存在本地专用浏览器配置中,约 48 小时过期后需重新登录。"
+        )
+        volc_hint.setObjectName("pageSub")
+        volc_hint.setWordWrap(True)
+        volc_layout.addWidget(volc_hint)
+        self.volc_status_label = QLabel()
+        self.volc_status_label.setObjectName("volcStatus")
+        self.volc_status_label.setWordWrap(True)
+        # Seed from the ball's current snapshot state so a logged-in user
+        # sees ✓ immediately instead of a 1-3 s "暂无登录信息" flash while
+        # the open-time CDP probe runs.
+        self._set_volc_status(self._seeded_login_state("volcengine", "logged_in", "no_login"))
+        volc_layout.addWidget(self.volc_status_label)
+        self.volc_login_btn = QPushButton("打开火山方舟登录窗口")
+        self.volc_login_btn.clicked.connect(self._open_volc_login)
+        volc_layout.addWidget(self.volc_login_btn)
         v.addWidget(self.volc_frame)
+
+        # Volcengine probe state -- polled every 1 s after the user clicks
+        # "打开火山方舟登录窗口" (mirrors the Qoder flow). The probe runs the
+        # real quota API fetch in the login window's console tab
+        # (verify_session) -- cookie presence alone reports false positives
+        # from expired cookies lingering in the profile. 1 s matches Qoder
+        # and shaves 2 s off the worst-case ball-update latency after the
+        # user closes the browser; the probe itself is a CDP evaluate +
+        # page-side fetch, both sub-second locally.
+        self._volc_poll = QTimer(self)
+        self._volc_poll.setInterval(1000)
+        self._volc_poll.timeout.connect(self._poll_volc_login)
+        self._volc_probe_attempts = 0
+        self._volc_probes: list = []
+        # Recheck mode: after the login window vanishes mid-poll, the poll
+        # switches to verifying the session via the headless Chrome for a
+        # few ticks before declaring the login failed (the window can also
+        # vanish because a background fetch CLOSED it on a valid session).
+        self._volc_recheck = False
+        self._volc_recheck_attempts = 0
 
         # API Key field (MiniMax / DeepSeek) - hidden for volcengine.
         self.key_frame = QFrame()
@@ -1121,8 +1522,9 @@ class SettingsDialog(QDialog):
         qoder_layout.setContentsMargins(0, 0, 0, 0)
         qoder_layout.setSpacing(10)
         qoder_hint = QLabel(
-            "无需粘贴凭证：点击下方按钮打开 Qoder 登录页，在浏览器中登录一次即可。\n"
-            "登录态保存在本地专用浏览器配置中，约 8 天过期后重新登录。"
+            "无需粘贴凭证:点击下方按钮打开 Qoder 登录页,"
+            "在浏览器中登录一次即可。\n"
+            "登录态保存在本地专用浏览器配置中,约 8 天过期后需重新登录。"
         )
         qoder_hint.setObjectName("pageSub")
         qoder_hint.setWordWrap(True)
@@ -1130,7 +1532,7 @@ class SettingsDialog(QDialog):
         self.qoder_status_label = QLabel()
         self.qoder_status_label.setObjectName("qoderStatus")
         self.qoder_status_label.setWordWrap(True)
-        self._set_qoder_status("no_login")
+        self._set_qoder_status(self._seeded_login_state("qoder", "logged_in", "no_login"))
         qoder_layout.addWidget(self.qoder_status_label)
         self.qoder_login_btn = QPushButton("打开 Qoder 登录窗口")
         self.qoder_login_btn.clicked.connect(self._open_qoder_login)
@@ -1152,6 +1554,15 @@ class SettingsDialog(QDialog):
         self.volc_frame.hide()
         self.key_frame.hide()
         self.qoder_frame.hide()
+
+        # Status reconciliation on dialog open: the status label defaults to
+        # "暂无登录信息" which is wrong if the user is already logged in
+        # (the headless polling Chrome on DEFAULT_PORT is alive with a
+        # valid session). Probe the live session after the dialog shows so
+        # the status reflects reality without requiring a fresh login.
+        # Deferred via singleShot(0) so the dialog paints first -- the
+        # probe is async and the result lands ~1 s later.
+        QTimer.singleShot(0, self._refresh_login_status_on_open)
 
     def _build_appearance_page(self, page):
         v = QVBoxLayout(page)
@@ -1385,15 +1796,12 @@ class SettingsDialog(QDialog):
             self.volc_frame.show()
             self.key_frame.hide()
             self.qoder_frame.hide()
-            # Prefer the original cURL when present -- that's the only form
-            # from which x_web_id can be re-extracted (the bare cookie
-            # doesn't carry it). Fall back to the cleaned cookie for legacy
-            # configs that pre-date this field.
-            self.cred_cookie.setPlainText(
-                c.get("original_curl") or c.get("cookie", "")
-            )
-            self.csrf_edit.setText(c.get("csrf_token", ""))
-            self.xwebid_edit.setText(c.get("x_web_id", ""))
+            # Start a probe against the LOGIN_PORT (visible login window)
+            # so the status reflects the live state of that Chrome: if it
+            # has the session cookie, status flips to logged_in; otherwise
+            # the user needs to click 打开登录窗口. Mirrors the qoder probe.
+            self._volc_probe_attempts = 0
+            self._volc_probe_async(LOGIN_PORT)
             self.apikey_edit.setText("")
         elif ptype == "qoder":
             self.volc_frame.hide()
@@ -1406,9 +1814,6 @@ class SettingsDialog(QDialog):
             self.key_frame.show()
             self.qoder_frame.hide()
             self.apikey_edit.setText(c.get("api_key", ""))
-            self.cred_cookie.setPlainText("")
-            self.csrf_edit.setText("")
-            self.xwebid_edit.setText("")
 
     def _open_qoder_login(self):
         """Open a visible browser window for (re)login to qoder.com."""
@@ -1428,9 +1833,9 @@ class SettingsDialog(QDialog):
         """Update the status line. state in: no_login / waiting / logged_in / timeout."""
         states = {
             "no_login": ("⚠ 暂无登录信息,请点击下方按钮打开 Qoder 登录窗口", "#f39c12"),
-            "waiting": ("⏳ 已打开登录窗口,请在其中完成登录(检测中…)", "#3b8bff"),
-            "logged_in": ("✓ 登录成功,数据将在下次轮询时刷新", "#2ecc71"),
-            "timeout": ("⚠ 未检测到登录完成,请重试", "#e74c3c"),
+            "waiting": ("⏳ 已打开 Qoder 登录窗口,请在其中完成登录(检测中…)", "#3b8bff"),
+            "logged_in": ("✓ 登录成功,数据已同步", "#2ecc71"),
+            "timeout": ("⚠ 未检测到 Qoder 登录完成,请确认登录后重试", "#e74c3c"),
         }
         text, color = states[state]
         self.qoder_status_label.setText(text)
@@ -1471,7 +1876,8 @@ class SettingsDialog(QDialog):
         self._qoder_probes = [p for p in self._qoder_probes if p.isRunning()]
         # Nudge MainWindow to refresh the ball right now -- otherwise it
         # would wait up to poll_interval_sec (10 s) before showing data.
-        self.applied.emit()
+        # login_completed (not applied): no config save mid-edit.
+        self.login_completed.emit()
 
     def _on_qoder_probe_fail(self, msg: str) -> None:
         # Keep status at "waiting" -- the user might still be logging in.
@@ -1485,22 +1891,215 @@ class SettingsDialog(QDialog):
                 return int(p.get("credentials", {}).get("cdp_port", 9333))
         return None
 
-    def _parse_curl(self):
-        parsed = _parse_curl_or_cookie(self.cred_cookie.toPlainText())
-        if not parsed:
+    def _open_volc_login(self):
+        """Open a visible browser window for (re)login to console.volcengine.com.
+
+        Mirrors the Qoder flow: open window, then start a 3 s poll that runs
+        the REAL quota-API fetch in the window's console tab (verify_session)
+        -- only a 200 with quota data flips the status to logged_in, after
+        which the ball refreshes. open_login_window takes care of closing the
+        headless polling Chrome first (the shared profile dir means Chrome's
+        process singleton would otherwise swallow the new window).
+        """
+        from providers.volcengine_cdp import open_login_window
+
+        port = LOGIN_PORT
+        _log.info(f"user clicked 打开火山方舟登录窗口; port={port}")
+        try:
+            open_login_window(port)
+        except Exception as e:
+            _log.error(f"open_login_window failed: {e}")
+            QMessageBox.warning(self, "提示", f"打开登录窗口失败: {e}")
             return
-        # NOTE: we intentionally do NOT replace the cookie textbox with the
-        # parsed cookie string. Keeping the original cURL in the textbox
-        # means the user (and _validate_current_editor / _commit_editor)
-        # can re-parse it any number of times -- e.g. after the user
-        # clears the x_web_id field and clicks 解析 again to recover it.
-        # The cleaned cookie is only extracted at save time by
-        # _commit_editor, so what gets persisted is still the bare cookie,
-        # never the raw cURL command.
-        if parsed.get("csrf_token"):
-            self.csrf_edit.setText(parsed["csrf_token"])
-        if parsed.get("x_web_id"):
-            self.xwebid_edit.setText(parsed["x_web_id"])
+        self._set_volc_status("waiting")
+        self._volc_probe_attempts = 0
+        self._volc_recheck = False
+        self._volc_probes.clear()
+        self._login_snapshot_override = None
+        self._volc_poll.start()
+        _log.info(f"poll started, waiting up to 180s for login")
+
+    def _seeded_login_state(self, ptype: str, logged_in_state: str, not_state: str) -> str:
+        """Pick the initial login status for a provider-type label.
+
+        ``_initial_login`` is keyed by provider id; the dialog's status
+        labels are per-type. A provider type is "logged in" when ANY of
+        its configured providers has a valid snapshot -- enough to flip
+        the label to ✓ without making the user re-open the browser.
+
+        Falls back to ``not_state`` when:
+        - The seed dict doesn't include any provider of this type
+        - No provider of this type is configured at all
+        """
+        for pid, ok in self._initial_login.items():
+            if not ok:
+                continue
+            for entry in _app_config.get("providers", []):
+                if entry.get("id") == pid and entry.get("type") == ptype:
+                    return logged_in_state
+        return not_state
+
+    def _set_volc_status(self, state: str) -> None:
+        """Update the volc status line. state in: no_login / waiting /
+        logged_in / timeout."""
+        states = {
+            "no_login":  ("⚠ 暂无登录信息,请点击下方按钮打开火山方舟登录窗口",
+                          "#f39c12"),
+            "waiting":   ("⏳ 已打开火山方舟登录窗口,请在其中完成登录(检测中…)",
+                          "#3b8bff"),
+            "logged_in": ("✓ 登录成功,数据已同步",
+                          "#2ecc71"),
+            "timeout":   ("⚠ 未检测到火山方舟登录完成,请确认登录后重试",
+                          "#e74c3c"),
+        }
+        text, color = states[state]
+        self.volc_status_label.setText(text)
+        self.volc_status_label.setStyleSheet(
+            f"color: {color}; font-size: 12px; font-weight: 600; background: transparent;"
+        )
+
+    def _on_volc_probe_ok(self, snapshot=None) -> None:
+        """Login confirmed (quota API returned 200 inside the login
+        window) -- stop polling, mark logged_in, and emit login_completed
+        so the ball refreshes.
+
+        ``snapshot`` carries the parsed ProviderSnapshot when the probe
+        had a provider to call parse_result on; the dialog then pushes it
+        straight to the ball, skipping a redundant headless fetch. None
+        means the parse failed or no provider was passed -- the dialog
+        falls back to refresh() (which spawns a fresh fetch).
+        """
+        _log.info(f"login confirmed after {self._volc_probe_attempts} attempt(s)")
+        self._volc_poll.stop()
+        self._volc_recheck = False
+        self._set_volc_status("logged_in")
+        self._volc_probes = [p for p in self._volc_probes if p.isRunning()]
+        # Stash the snapshot for _on_login_completed to consume. Do NOT
+        # save_config() here -- the login state lives in the Chrome profile,
+        # not the config, and the dialog may be mid-edit.
+        self._login_snapshot_override = snapshot
+        self.login_completed.emit()
+
+    def _on_volc_probe_fail(self, msg: str) -> None:
+        if msg == "登录窗口已关闭" and not self._volc_recheck:
+            # The window vanished mid-poll. Either the user closed it (gave
+            # up) or a background fetch closed it BECAUSE the session just
+            # turned valid -- the two are indistinguishable from here.
+            # Switch the poll to re-verify via the headless Chrome for a
+            # few ticks before resetting the status.
+            _log.info("login window gone; re-checking session via headless")
+            self._volc_recheck = True
+            self._volc_recheck_attempts = 0
+        elif msg and msg not in ("no cookie", "系统正忙，稍后自动重试"):
+            # Keep status at "waiting" -- the user might still be logging
+            # in. Only the 90-attempt timeout changes the status.
+            _log.warning(f"probe failed: {msg}")
+        self._volc_probes = [p for p in self._volc_probes if p.isRunning()]
+
+    def _refresh_login_status_on_open(self):
+        """Reconcile status on dialog open with a live CDP probe.
+
+        The status label is seeded from the ball's snapshot state in
+        __init__ (instant). This method only runs the heavier CDP probe
+        when the seed said "not logged in" -- the only case where we
+        genuinely don't know whether the user has a valid session.
+
+        Skipped entirely when:
+        - A poll is already running (the login flow owns the status)
+        - The seed already says logged_in (the ball proves the session
+          is alive; no need to spend 1-3 s re-probing)
+        """
+        if not self._volc_poll.isActive() and \
+                self._seeded_login_state("volcengine", "logged_in", "no_login") == "no_login":
+            has_volc = any(
+                p.get("type") == "volcengine"
+                for p in _app_config.get("providers", [])
+            )
+            if has_volc:
+                self._volc_probe_async(DEFAULT_PORT, require_window=False)
+        if not self._qoder_poll.isActive() and \
+                self._seeded_login_state("qoder", "logged_in", "no_login") == "no_login":
+            qoder_port = self._current_qoder_port()
+            if qoder_port is not None:
+                self._qoder_probe_async(qoder_port)
+
+    def _volc_probe_async(self, port: int, require_window: bool = False) -> None:
+        """Run a single non-blocking session check."""
+        # Pass the live provider instance so the probe can parse the
+        # verify_session payload into a snapshot and hand it directly to
+        # the ball (avoids a redundant headless fetch on login success).
+        provider = self._volc_probe_provider(port)
+        probe = _VolcengineLoginCheck(port, provider=provider,
+                                      require_window=require_window, parent=self)
+        probe.ok.connect(self._on_volc_probe_ok)
+        probe.fail.connect(self._on_volc_probe_fail)
+        probe.finished.connect(probe.deleteLater)
+        self._volc_probes.append(probe)
+        probe.start()
+
+    def _volc_probe_provider(self, port: int):
+        """Return the VolcengineProvider for a given CDP port, if any.
+
+        The probe needs a live provider (not just the port) to call
+        parse_result. Match by credentials.cdp_port first, then fall back
+        to any volcengine provider (the user typically only has one).
+        """
+        for entry in _app_config.get("providers", []):
+            if entry.get("type") != "volcengine":
+                continue
+            creds = entry.get("credentials", {})
+            if int(creds.get("cdp_port", DEFAULT_PORT)) == port:
+                try:
+                    return build_provider(entry)
+                except Exception:
+                    return None
+        # Fallback: first volcengine provider we can build (probe still
+        # works without a provider -- it just emits ok(None) and the
+        # dialog falls back to the refresh path).
+        for entry in _app_config.get("providers", []):
+            if entry.get("type") == "volcengine":
+                try:
+                    return build_provider(entry)
+                except Exception:
+                    return None
+        return None
+
+    def _poll_volc_login(self) -> None:
+        """Timer tick: launch a probe, stop polling on success or timeout."""
+        self._volc_probe_attempts += 1
+        if self._volc_probe_attempts > 180:  # 180 x 1s = 3 min (was 90 x 3s = 4.5 min)
+            _log.warning(f"poll timeout after {self._volc_probe_attempts} attempts")
+            self._volc_poll.stop()
+            self._set_volc_status("timeout")
+            return
+        if self._volc_recheck:
+            # Login window vanished mid-poll: verify via the headless
+            # Chrome. A background fetch that closed the window on a valid
+            # session makes this succeed -> normal ✓ path; a user who gave
+            # up fails 5 ticks (~5 s) -> reset.
+            self._volc_recheck_attempts += 1
+            if self._volc_recheck_attempts > 5:
+                _log.info("recheck: session really gone; resetting status")
+                self._volc_poll.stop()
+                self._volc_recheck = False
+                self._set_volc_status("no_login")
+                return
+            self._volc_probe_async(DEFAULT_PORT, require_window=False)
+            return
+        port = self._current_volc_port()
+        if port is None:
+            _log.warning(f"poll: no volc provider port found "
+                         f"(attempts={self._volc_probe_attempts})")
+            return
+        if self._volc_probe_attempts == 1 or self._volc_probe_attempts % 15 == 0:
+            _log.info(f"poll attempt {self._volc_probe_attempts}/90 on port {port}")
+        self._volc_probe_async(port, require_window=True)
+
+    def _current_volc_port(self) -> int:
+        """Port of the visible login window (where the login poll runs the
+        real quota-API check). Provider.fetch() uses DEFAULT_PORT for its
+        headless Chrome."""
+        return LOGIN_PORT
 
     def _add_provider(self):
         ptype = self.type_combo.currentData()
@@ -1530,10 +2129,7 @@ class SettingsDialog(QDialog):
             self._load_editor(_app_config["providers"][new_index])
 
     def _del_provider_by_id(self, pid: str):
-        if pid == _app_config.get("primary"):
-            QMessageBox.warning(self, "提示", "不能删除当前主平台")
-            return
-        # Confirm before destroying a non-primary provider's config.
+        # Confirm before destroying a provider's config.
         label = next((p.get("label", pid) for p in _app_config["providers"]
                       if p["id"] == pid), pid)
         ans = QMessageBox.question(
@@ -1545,6 +2141,7 @@ class SettingsDialog(QDialog):
         if ans != QMessageBox.StandardButton.Yes:
             return
         # Find and remove the provider entry.
+        deleted_was_primary = pid == _app_config.get("primary")
         for i, p in enumerate(_app_config["providers"]):
             if p["id"] == pid:
                 _app_config["providers"].pop(i)
@@ -1553,6 +2150,15 @@ class SettingsDialog(QDialog):
                 elif self._editing_index is not None and self._editing_index > i:
                     self._editing_index -= 1
                 break
+        # If we just deleted the primary, auto-pick a replacement so the
+        # ball doesn't end up pointing at a ghost id. Falling back to ""
+        # when nothing's left is intentional: the ball renders an empty
+        # state (see BallWidget.set_error + _apply_snapshots) and the user
+        # can right-click -> 设置 to add a new one. No more "不能删除当
+        # 前主平台" lock -- the user controls their config.
+        if deleted_was_primary:
+            remaining = _app_config.get("providers", [])
+            _app_config["primary"] = remaining[0]["id"] if remaining else ""
         self._reload_list()
 
     def _commit_editor(self):
@@ -1565,43 +2171,15 @@ class SettingsDialog(QDialog):
         # Only save credentials relevant to this provider type.
         ptype = p.get("type", "")
         if ptype == "volcengine":
-            cookie_text = self.cred_cookie.toPlainText().strip()
-            # Defense-in-depth: if the cookie textbox still holds a raw cURL
-            # command (user pasted a cURL but didn't click the 解析 button),
-            # parse it here so we never persist the whole cURL as the Cookie
-            # header value. The HTTP layer rejects a multi-line cURL command
-            # in the Cookie header with InvalidHeader / 401, which surfaces
-            # as a red error on the floating ball. We parse whenever the
-            # textbox looks like a cURL -- this also catches the "fields are
-            # stale from an old provider, user pasted a new cURL" case that
-            # pure field-only validation would miss.
-            looks_curl = (
-                "curl " in cookie_text
-                or "-H " in cookie_text
-                or "--header" in cookie_text
-                or "-b " in cookie_text
-                or "--cookie" in cookie_text
-            )
-            original_curl = ""
-            if looks_curl:
-                # Snapshot the raw cURL textbox content BEFORE we overwrite
-                # cookie_text with the parsed bare cookie below. This is the
-                # only form from which x_web_id can be re-extracted on
-                # reopen, so we must keep it around verbatim.
-                original_curl = cookie_text
-                parsed = _parse_curl_or_cookie(cookie_text)
-                if parsed.get("cookie"):
-                    cookie_text = parsed["cookie"]
-                if parsed.get("csrf_token"):
-                    self.csrf_edit.setText(parsed["csrf_token"])
-                if parsed.get("x_web_id"):
-                    self.xwebid_edit.setText(parsed["x_web_id"])
-            p["credentials"] = {
-                "cookie": cookie_text,
-                "csrf_token": self.csrf_edit.text().strip(),
-                "x_web_id": self.xwebid_edit.text().strip(),
-                "original_curl": original_curl,
-            }
+            # No user-typed credentials. Login state lives in the dedicated
+            # Chrome profile (session cookie) and quota data is fetched via
+            # CDP at every poll. Keep cdp_port if the user set one; drop any
+            # legacy curl-style fields that no longer apply.
+            creds = p.get("credentials", {})
+            new_creds: dict = {}
+            if creds.get("cdp_port"):
+                new_creds["cdp_port"] = creds["cdp_port"]
+            p["credentials"] = new_creds
         elif ptype == "qoder":
             # No user-entered credentials: login state lives in the dedicated
             # Chrome profile. Keep cdp_port if the user set one.
@@ -1628,7 +2206,11 @@ class SettingsDialog(QDialog):
         if not self._validate_current_editor():
             return False
         self._commit_editor()
-        _app_config["primary"] = self.primary_combo.currentData() or ""
+        # Never blank primary via an empty combo selection (can happen when
+        # the provider list was just emptied): a stale primary in memory is
+        # recoverable, an empty one silently persisted is not.
+        if self.primary_combo.currentData():
+            _app_config["primary"] = self.primary_combo.currentData()
         _app_config["theme"] = self.theme_combo.currentData() or "dark"
         _app_config["poll_interval_sec"] = self.interval_combo.currentData() or 10
         _app_config["warning_percent"] = self.warn_combo.currentData() or 80
@@ -1639,6 +2221,12 @@ class SettingsDialog(QDialog):
         if not _app_config.get("primary"):
             _app_config["primary"] = _app_config["providers"][0]["id"]
         self._original_theme = _app_config["theme"]
+        # Refresh the rollback snapshot: a subsequent 取消 / X should only
+        # revert changes made AFTER this save, not the save itself
+        # (otherwise a user who applies then later cancels would lose
+        # work they explicitly committed).
+        import copy as _copy
+        self._saved_config_snapshot = _copy.deepcopy(_app_config)
         self.applied.emit()
         # Flash whichever button the user actually clicked: apply_btn gets
         # "已应用 ✓", save_btn (and any other trigger) gets "已保存 ✓".
@@ -1673,36 +2261,11 @@ class SettingsDialog(QDialog):
         p = _app_config["providers"][self._editing_index]
         ptype = p.get("type", "")
         if ptype == "volcengine":
-            cookie_text = self.cred_cookie.toPlainText().strip()
-            looks_curl = (
-                "curl " in cookie_text
-                or "-H " in cookie_text
-                or "--header" in cookie_text
-                or "-b " in cookie_text
-                or "--cookie" in cookie_text
-            )
-            if looks_curl:
-                # Fresh cURL pasted: parse it, fill fields. We do NOT clean
-                # the cookie textbox here -- keeping the original cURL lets
-                # the user re-click 解析 (or re-apply) to recover a field
-                # they accidentally cleared. The bare cookie is only
-                # extracted at commit time by _commit_editor.
-                parsed = _parse_curl_or_cookie(cookie_text)
-                if not parsed.get("csrf_token") or not parsed.get("x_web_id"):
-                    QMessageBox.warning(self, "提示", "cURL/Cookie解析失败")
-                    return False
-                self.csrf_edit.setText(parsed["csrf_token"])
-                self.xwebid_edit.setText(parsed["x_web_id"])
-                return True
-            # Plain cookie: trust the cached token fields.
-            if (not self.csrf_edit.text().strip()
-                    or not self.xwebid_edit.text().strip()):
-                QMessageBox.warning(
-                    self, "提示",
-                    "csrf_token / x_web_id 不能为空，请粘贴 cURL 后点击"
-                    "\"从上方解析\"按钮",
-                )
-                return False
+            # Login-based: no required user-edited fields. If credentials
+            # are missing we let save proceed; the next fetch() will surface
+            # a 401 and the floating ball will show a clear error. Forcing
+            # a login here would block users who added a volc provider just
+            # to see the form layout.
             return True
         # MiniMax / DeepSeek: api_key is the only required credential.
         if ptype not in ("volcengine", "qoder"):
@@ -1718,10 +2281,23 @@ class SettingsDialog(QDialog):
             super().accept()
 
     def reject(self):
-        # Revert theme on cancel/close if user changed it during preview.
-        if _app_config.get("theme") != self._original_theme:
-            _app_config["theme"] = self._original_theme
-            self.theme_changed.emit()
+        # Roll back ALL in-memory edits made during this dialog session:
+        # adds / deletes of providers, label / credential edits, primary
+        # changes, theme tweaks. The snapshot was taken in __init__ from
+        # whatever config.json held at open time, so the user lands back
+        # at the last-saved state.
+        import copy as _copy
+        snapshot = self._saved_config_snapshot
+        _app_config.clear()
+        _app_config.update(_copy.deepcopy(snapshot))
+        # Theme revert was originally the only rollback -- emit the live
+        # theme change so MainWindow's ball/card refresh immediately.
+        self.theme_changed.emit()
+        # MainWindow listens for this to rebuild self.providers from the
+        # restored _app_config and refresh the ball (otherwise stale
+        # providers from this session would keep being polled).
+        self.cancelled.emit()
+        super().reject()
         super().reject()
 
     def _flash_button(self, btn: QPushButton, success_text: str):
@@ -1822,6 +2398,9 @@ class MonitorApp:
         self.tray.show()
         self._update_tray_menu()
 
+        self._fetch_worker: _FetchWorker | None = None
+        self._refresh_pending = False
+
         self.timer = QTimer(self.ball)
         self.timer.timeout.connect(self.refresh)
         self.timer.start(_app_config.get("poll_interval_sec", 10) * 1000)
@@ -1830,6 +2409,10 @@ class MonitorApp:
         screen = self.app.primaryScreen().geometry()
         self.ball.move(screen.width() - BALL_SIZE - 30, screen.height() - BALL_SIZE - 80)
         self.refresh()
+        # Begin edge-dock polling: ball auto-hides to a 10 px tab when
+        # idle near a screen edge (Xunlei-style). start_dock_watch is
+        # safe to call after show() -- it reads the current position.
+        self.ball.start_dock_watch()
 
     def _rebuild_providers(self):
         self.providers = {}
@@ -1940,7 +2523,14 @@ class MonitorApp:
         self.ball.update()
 
     def open_settings(self):
-        dlg = SettingsDialog(parent=None)
+        # Seed the dialog's per-provider login labels with the current
+        # reality: if the ball is showing valid data for a provider, that
+        # provider's session is alive. Otherwise starting every dialog
+        # open at "暂无登录信息" and waiting for a CDP probe (1-3 s) to
+        # flip it is needlessly noisy -- the user already KNOWS they're
+        # logged in (the ball has numbers on it).
+        initial_login = self._snapshot_login_state()
+        dlg = SettingsDialog(parent=None, initial_login=initial_login)
         # Center on screen (not relative to ball position).
         screen = self.app.primaryScreen().geometry()
         dlg.move(
@@ -1948,6 +2538,12 @@ class MonitorApp:
             screen.center().y() - dlg.height() // 2,
         )
         dlg.theme_changed.connect(self._on_live_theme_change)
+        dlg.login_completed.connect(self._on_login_completed)
+        # Cancelled fires from reject() AFTER _app_config has been rolled
+        # back to the pre-dialog snapshot, so we can rebuild self.providers
+        # to match and refresh the ball (otherwise the half-edited provider
+        # would keep being polled until the next app restart).
+        dlg.cancelled.connect(self._on_dialog_cancelled)
         # "保存" now applies (persist + take effect) without closing, so the
         # user can keep configuring. Closing the dialog (X / ESC / 取消)
         # ends exec().
@@ -1955,7 +2551,86 @@ class MonitorApp:
         dlg.exec()
         # No final save here: every apply already persists via _on_settings_applied.
 
+    def _snapshot_login_state(self) -> dict[str, bool]:
+        """Per-provider login state at this instant, derived from snapshots.
+
+        True when the most recent fetch for a provider succeeded with
+        quota levels. Used to seed the dialog's status labels so they
+        don't briefly flash "暂无登录信息" before flipping to "登录成功".
+        """
+        out: dict[str, bool] = {}
+        for pid, snap in self.snapshots.items():
+            out[pid] = bool(snap and snap.ok and snap.levels)
+        return out
+
+    def _on_login_completed(self):
+        """A provider login completed in the settings dialog (qoder /
+        volcengine). Rebuild providers from the in-memory config -- a
+        freshly added provider that was never applied yet still needs to
+        start fetching -- and refresh the ball immediately.
+
+        Also normalises ``primary``: the probe fires before the user
+        clicks 保存 (the cookie lives in the Chrome profile, not in the
+        config), so apply()'s "default primary to first provider" path
+        never ran. Without this, the ball sees ``primary=''`` in
+        _apply_snapshots and stays on the red ``!`` despite a successful
+        fetch.
+
+        Volcengine probe passes a pre-parsed snapshot through the
+        ``_login_snapshot_override`` stash (set by _on_volc_probe_ok):
+        when present we push it straight to the ball, skipping a
+        redundant headless fetch that would cost ~2-3 s. Qoder's probe
+        only checks cookie presence so it leaves the stash as None and
+        we fall through to refresh().
+
+        Deliberately does NOT save_config(): login state lives in the
+        Chrome profile, and the dialog may be mid-edit (the user may have
+        just deleted a provider to reconfigure). Persisting on
+        login-success is how a config once got wiped to providers=[],
+        primary='' on disk.
+        """
+        _log.info("login completed in settings; refreshing ball")
+        # Mirror apply()'s "primary defaults to first provider" rule so
+        # the ball finds the snapshot when the user hasn't clicked 保存 yet.
+        providers = _app_config.get("providers", [])
+        if providers and not _app_config.get("primary"):
+            _app_config["primary"] = providers[0]["id"]
+            _log.info(f"login completed with empty primary; defaulting to {_app_config['primary']}")
+        self._rebuild_providers()
+        snap = getattr(self, "_login_snapshot_override", None)
+        if snap is not None:
+            primary = _app_config.get("primary")
+            _log.info(f"login completed with pre-parsed snapshot for {primary}; "
+                      f"skipping redundant fetch")
+            self._apply_snapshots({primary: snap})
+            self._login_snapshot_override = None
+            return
+        self.refresh()
+
+    def _on_dialog_cancelled(self):
+        """User closed the settings dialog with X / ESC / 取消 and the
+        dialog already rolled _app_config back to its pre-open snapshot.
+
+        Rebuild self.providers to drop anything that was added during the
+        session, then refresh the ball so the rolled-back state takes
+        effect immediately. The next fetch cycle will pick up the
+        reverted provider list and the ball returns to whatever was
+        showing before the dialog opened.
+        """
+        _log.info("settings dialog cancelled; rolling back in-memory state")
+        self._login_snapshot_override = None
+        self._rebuild_providers()
+        self._update_tray_menu()
+        self.refresh()
+
     def _on_settings_applied(self):
+        if not _app_config.get("providers"):
+            # Belt and braces: apply() already blocks an empty provider
+            # list, but never persist a config with zero providers -- the
+            # ball has nothing to show and the user is locked out of the
+            # monitor until they hand-edit config.json.
+            _log.warning("skipping save: provider list is empty")
+            return
         save_config(_app_config)
         self._rebuild_providers()
         self.ball.warn = _app_config.get("warning_percent", 80)
@@ -1977,26 +2652,46 @@ class MonitorApp:
         # Ensure ball/card use the latest theme before rendering.
         self.ball.refresh_theme()
         self.card.refresh_theme()
+        # Provider fetches (CDP-based ones especially) can block for tens of
+        # seconds -- they run in a background thread and hand their snapshots
+        # back via _apply_snapshots. If the previous cycle is still in flight,
+        # remember that a refresh was requested and run it when that cycle
+        # lands (e.g. login just completed while a fetch was mid-skip).
+        if self._fetch_worker is not None and self._fetch_worker.isRunning():
+            _log.debug("refresh: previous fetch worker still running, deferring")
+            self._refresh_pending = True
+            return
+        self._refresh_pending = False
+        w = _FetchWorker(self.providers)
+        w.done.connect(self._apply_snapshots)
+        w.finished.connect(self._on_fetch_worker_done)
+        self._fetch_worker = w
+        w.start()
+
+    def _on_fetch_worker_done(self):
+        # Drop the reference so the finished QThread can be GC'd and the next
+        # refresh() starts a fresh worker. A refresh requested while this
+        # cycle was running fires now.
+        self._fetch_worker = None
+        if self._refresh_pending:
+            self.refresh()
+
+    def _apply_snapshots(self, snaps: dict):
+        # Runs on the UI thread via the queued signal connection.
+        self.snapshots.update(snaps)
         primary = _app_config.get("primary")
-        any_ok = False
-        for pid, p in self.providers.items():
-            try:
-                snap = p.fetch()
-                self.snapshots[pid] = snap
-                any_ok = True
-            except Exception as e:
-                self.snapshots[pid] = ProviderSnapshot(
-                    provider_id=pid, ok=False, error=str(e)
-                )
-        # Update ball with primary snapshot.
         primary_snap = self.snapshots.get(primary)
         if primary_snap and primary_snap.ok and primary_snap.levels:
             self.ball.set_error(False)
             if self.ball.current_level not in [q.level for q in primary_snap.levels]:
                 self.ball.current_level = primary_snap.levels[0].level
             self.ball.update_snapshot(primary_snap, self.ball.current_level)
+            _log.info(f"ball: primary={primary} ok "
+                      f"({', '.join(f'{q.label} {q.used_percent:.1f}%' for q in primary_snap.levels)})")
         else:
             self.ball.set_error(True)
+            err = primary_snap.error if primary_snap else "no snapshot yet"
+            _log.warning(f"ball: primary={primary} ERROR state: {err}")
 
         # Update detail card: only show primary provider.
         primary_snap = self.snapshots.get(primary)
@@ -2016,7 +2711,78 @@ class MonitorApp:
             self.tray.setToolTip(f"Coding Plan · 失败: {err}")
 
     def run(self):
+        # On exit (tray quit / X close / sys.exit), gracefully close any
+        # dedicated Chrome instances we spawned so the profile dir is
+        # unlocked and can be deleted without taskkill. Runs even on
+        # crash-like exits because PySide6 fires aboutToQuit before
+        # tearing down the app.
+        self.app.aboutToQuit.connect(self._close_all_cdp_browsers)
+        # Stop the ball's dock-poll timer first so it doesn't fire into
+        # a half-destroyed widget during the chrome teardown race below.
+        self.app.aboutToQuit.connect(self.ball.stop_dock_watch)
         sys.exit(self.app.exec())
+
+    def _close_all_cdp_browsers(self) -> None:
+        """Walk configured volcengine + qoder providers, close any live
+        headless Chrome so profile dirs are released.
+
+        Volcengine uses two ports (LOGIN_PORT for the visible login
+        window, DEFAULT_PORT for the headless polling Chrome). Both share
+        the same profile dir, so both must be closed for the dir to be
+        unlocked on Windows.
+
+        Also stops the poll timer and waits (briefly) for the fetch worker:
+        PySide6 aborts the process if a QThread is destroyed while still
+        running, and closing Chrome under an in-flight CDP round-trip
+        crashes the worker's websocket reads.
+
+        Without this, killing the app leaves Chrome running and the
+        `volcengine_profile/` / `qoder_profile/` directories stay
+        locked on Windows (you can't delete them, and re-login fails
+        because the new Chrome can't read the locked files)."""
+        # Stop the poll timer first so no new fetch worker starts while
+        # we're tearing Chrome down.
+        self.timer.stop()
+        w = self._fetch_worker
+        if w is not None and w.isRunning():
+            _log.info("waiting for fetch worker before closing Chrome")
+            if not w.wait(5000):
+                _log.warning("fetch worker still running after 5s; "
+                             "closing Chrome anyway")
+
+        from providers.volcengine_cdp import (
+            VolcengineCdp,
+            close_browser,
+            LOGIN_PORT as VLOGIN,
+            DEFAULT_PORT as VDFLT,
+        )
+        from providers.qoder import QoderCdp
+
+        # Build (port, cdp) list. Volcengine gets BOTH ports; qoder gets
+        # the one configured port. close_browser works for both classes
+        # (it only needs .base / .is_alive / .port).
+        targets: list[tuple[int, object]] = []
+        for p in _app_config.get("providers", []):
+            ptype = p.get("type", "")
+            if ptype == "volcengine":
+                targets.append((VLOGIN, VolcengineCdp(VLOGIN)))
+                targets.append((VDFLT, VolcengineCdp(VDFLT)))
+            elif ptype == "qoder":
+                port = int(p.get("credentials", {}).get("cdp_port", 9333))
+                targets.append((port, QoderCdp(port)))
+
+        for port, cdp in targets:
+            try:
+                if not cdp.is_alive(timeout=0.5):
+                    continue
+                _log.info(f"closing Chrome on port {port}")
+                # settle=0: teardown, nothing respawns on the profile.
+                if close_browser(cdp, settle=0.0):
+                    _log.info(f"Chrome on port {port} closed cleanly")
+                else:
+                    _log.warning(f"Chrome on port {port} did not exit in time")
+            except Exception as e:
+                _log.warning(f"cleanup error for port {port}: {e}")
 
 
 def main():

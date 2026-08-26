@@ -4,6 +4,7 @@ config.json.bak
 *.bak
 state.json
 qoder_profile/
+volcengine_profile/
 
 # python
 __pycache__/
