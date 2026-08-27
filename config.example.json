@@ -9,11 +9,7 @@
       "id": "volcengine",
       "type": "volcengine",
       "label": "火山方舟-coding plan",
-      "credentials": {
-        "cookie": "PASTE_YOUR_FULL_COOKIE_STRING_HERE",
-        "csrf_token": "PASTE_CSRF_TOKEN_HERE",
-        "x_web_id": "PASTE_X_WEB_ID_HERE"
-      }
+      "credentials": {}
     },
     {
       "id": "minimax",

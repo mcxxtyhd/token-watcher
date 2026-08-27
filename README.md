@@ -84,7 +84,7 @@ Qoder 没有 API key 机制，额度查询依赖浏览器里的加密登录 cook
 1. 在右侧的凭证框下方，点 **"打开 Qoder 登录窗口"** 按钮
 2. 程序会帮你打开一个 Chrome 窗口，自动跳到 [Qoder 用量页](https://qoder.com/account/usage)
 3. 在这个窗口里完成登录（账号密码 / Google / GitHub 都行）
-4. 登录成功后直接关掉这个窗口 —— cookie 已经写到 `qoder_profile/`
+4. 登录成功后无需任何操作：程序几秒内自动检测到登录态，登录窗口会自动关闭，设置面板出现 `✓ 登录成功,数据已同步`
 
 **之后**：程序每次轮询都用这个专属 Chrome 在后台取数。cookie 约 8 天有效期内不用再管。
 
@@ -98,7 +98,7 @@ Qoder 没有 API key 机制，额度查询依赖浏览器里的加密登录 cook
 
 ### 方式一：下载现成的 exe（推荐，无需装任何东西）
 
-去本项目的 [Releases 页面](../../releases)，下载 `tokenWatch.exe`，双击就能跑。
+去本项目的 [Releases 页面](../../releases)，下载最新版的 `CodingPlanMonitor-v*-windows-x64.zip`，解压到任意目录，双击文件夹里的 `CodingPlanMonitor.exe` 就能跑。`exe` 和 `_internal/` 必须放在同一目录下，不要拆开。
 
 第一次用：在 exe 同目录放一个 `config.json` 文件写你的配置（可以从仓库的 `config.example.json` 复制改名）。之后程序会记住配置，直接双击 exe 启动即可。
 
@@ -112,6 +112,15 @@ Qoder 没有 API key 机制，额度查询依赖浏览器里的加密登录 cook
 pip install -r requirements.txt
 python monitor.py
 ```
+
+### 方式三：自己打包 exe（不依赖 Releases）
+
+```bash
+pip install pyinstaller
+pyinstaller --noconfirm tokenWatch.spec
+```
+
+产物在 `dist/tokenWatch/`，整个文件夹一起分发；`exe` 旁的 `_internal/` 含 `psutil`、Qt 插件和图标等运行时依赖，缺一个就起不来。`tokenWatch.spec` 里已经预置了 `psutil` 的 hiddenimport 和 `icon/` / `image/` 资源的打包路径。
 
 ## 设置面板说明
 
