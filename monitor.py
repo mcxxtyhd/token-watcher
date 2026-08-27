@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 import time
 
@@ -256,56 +257,6 @@ def _auto_labels() -> dict:
     return out
 
 
-def _parse_curl_or_cookie(text: str) -> dict:
-    """Accept a full `Copy as cURL` blob or a bare cookie string."""
-    text = text.strip()
-    if not text:
-        return {}
-    import re
-
-    looks_curl = any(
-        tok in text for tok in ("curl ", "curl.exe", "-H ", "--header", "-b ", "--cookie")
-    )
-    cookie = ""
-    csrf = ""
-    x_web_id = ""
-    if looks_curl:
-        m = re.search(r"-b\s+'([^']*)'", text) or re.search(r'-b\s+"([^"]*)"', text)
-        if m:
-            cookie = m.group(1)
-        if not cookie:
-            m = re.search(r"-H\s+'[Cc]ookie:\s*([^']+)'", text) or re.search(
-                r'-H\s+"[Cc]ookie:\s*([^"]+)"', text
-            )
-            if m:
-                cookie = m.group(1)
-        m = re.search(r"-H\s+'[Xx]-[Cc]srf-[Tt]oken:\s*([^']+)'", text) or re.search(
-            r'-H\s+"[Xx]-[Cc]srf-[Tt]oken:\s*([^"]+)"', text
-        )
-        if m:
-            csrf = m.group(1).strip()
-        m = re.search(r"-H\s+'[Xx]-[Ww]eb-[Ii]d:\s*([^']+)'", text) or re.search(
-            r'-H\s+"[Xx]-[Ww]eb-[Ii]d:\s*([^"]+)"', text
-        )
-        if m:
-            x_web_id = m.group(1).strip()
-    else:
-        cookie = text
-
-    if not csrf:
-        for pair in cookie.split(";"):
-            pair = pair.strip()
-            if pair.startswith("csrfToken="):
-                csrf = pair.split("=", 1)[1]
-                break
-    result = {"cookie": cookie}
-    if csrf:
-        result["csrf_token"] = csrf
-    if x_web_id:
-        result["x_web_id"] = x_web_id
-    return result
-
-
 # ---------------------------------------------------------------------------
 # config loading / migration
 # ---------------------------------------------------------------------------
@@ -346,12 +297,13 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict) -> None:
-    CONFIG_PATH.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
-
-
-# module-level save hook (referenced by providers that need to persist creds)
-def _save_config() -> None:
-    save_config(_app_config)
+    # Atomic write: dump to a temp file first, then swap it in. A crash or
+    # power loss mid-write must not leave a truncated config.json (the user
+    # would lose every provider entry on next start).
+    data = json.dumps(cfg, indent=2, ensure_ascii=False)
+    tmp = CONFIG_PATH.with_suffix(".json.tmp")
+    tmp.write_text(data, encoding="utf-8")
+    os.replace(tmp, CONFIG_PATH)
 
 
 _app_config: dict = {}
@@ -1029,6 +981,30 @@ class _QoderCookieProbe(QThread):
                 self.fail.emit("no cookie")
         except Exception as e:
             self.fail.emit(str(e))
+
+
+class _QoderCloseBrowser(QThread):
+    """Close the qoder Chrome on a background thread (Browser.close can block
+    up to ~10s waiting for the debug port to free up).
+
+    Triggered from the settings dialog the moment the cookie probe flips to
+    OK, so the user doesn't have to close the window themselves. Mirrors
+    Volcengine's "auto-close after login" UX: the dialog-initiated close is
+    the snappy path, and QoderProvider.fetch() is the safety net for the
+    race where a fetch starts before this thread finishes.
+    """
+
+    def __init__(self, port: int, parent=None):
+        super().__init__(parent)
+        self._port = port
+
+    def run(self) -> None:
+        from providers.qoder import QoderCdp, close_browser
+
+        try:
+            close_browser(QoderCdp(self._port))
+        except Exception:
+            pass
 
 
 class _VolcengineLoginCheck(QThread):
@@ -1874,6 +1850,15 @@ class SettingsDialog(QDialog):
         self._set_qoder_status("logged_in")
         # Drop finished probes so they can be GC'd.
         self._qoder_probes = [p for p in self._qoder_probes if p.isRunning()]
+        # Auto-close the visible login window on a background thread (Browser.close
+        # blocks up to ~10s). Mirrors Volcengine's UX: as soon as the probe
+        # detects a valid session the browser window closes itself.
+        port = self._current_qoder_port()
+        if port is not None:
+            closer = _QoderCloseBrowser(port, self)
+            closer.finished.connect(closer.deleteLater)
+            self._qoder_probes.append(closer)
+            closer.start()
         # Nudge MainWindow to refresh the ball right now -- otherwise it
         # would wait up to poll_interval_sec (10 s) before showing data.
         # login_completed (not applied): no config save mid-edit.
@@ -2298,7 +2283,6 @@ class SettingsDialog(QDialog):
         # providers from this session would keep being polled).
         self.cancelled.emit()
         super().reject()
-        super().reject()
 
     def _flash_button(self, btn: QPushButton, success_text: str):
         """Briefly turn `btn` green with `success_text` to confirm the apply.
@@ -2420,7 +2404,7 @@ class MonitorApp:
             try:
                 self.providers[entry["id"]] = build_provider(entry)
             except Exception as e:
-                print(f"[provider] failed to build {entry.get('id')}: {e}", file=sys.stderr)
+                _log.warning(f"failed to build {entry.get('id')}: {e}")
 
     def _make_icon(self) -> QIcon:
         pix = QPixmap(16, 16)
@@ -2711,16 +2695,24 @@ class MonitorApp:
             self.tray.setToolTip(f"Coding Plan · 失败: {err}")
 
     def run(self):
+        # Stop the ball's dock-poll timer on quit so it doesn't fire into
+        # a half-destroyed widget.
+        self.app.aboutToQuit.connect(self.ball.stop_dock_watch)
+        rc = self.app.exec()
         # On exit (tray quit / X close / sys.exit), gracefully close any
         # dedicated Chrome instances we spawned so the profile dir is
-        # unlocked and can be deleted without taskkill. Runs even on
-        # crash-like exits because PySide6 fires aboutToQuit before
-        # tearing down the app.
-        self.app.aboutToQuit.connect(self._close_all_cdp_browsers)
-        # Stop the ball's dock-poll timer first so it doesn't fire into
-        # a half-destroyed widget during the chrome teardown race below.
-        self.app.aboutToQuit.connect(self.ball.stop_dock_watch)
-        sys.exit(self.app.exec())
+        # unlocked and can be deleted without taskkill.
+        #
+        # Runs AFTER exec() returns, not from aboutToQuit: close_browser can
+        # block for seconds waiting on CDP ports, and running it from the
+        # aboutToQuit handler would freeze the UI thread while the ball and
+        # tray are still on screen. With the event loop already stopped the
+        # same code paths all run, just without a visible freeze. A plain
+        # fire-and-forget thread is NOT an option either: the process would
+        # exit mid-cleanup and leave the zombie Chrome / locked profile this
+        # teardown exists to prevent.
+        self._close_all_cdp_browsers()
+        sys.exit(rc)
 
     def _close_all_cdp_browsers(self) -> None:
         """Walk configured volcengine + qoder providers, close any live
@@ -2753,22 +2745,26 @@ class MonitorApp:
         from providers.volcengine_cdp import (
             VolcengineCdp,
             close_browser,
-            LOGIN_PORT as VLOGIN,
             DEFAULT_PORT as VDFLT,
         )
         from providers.qoder import QoderCdp
 
-        # Build (port, cdp) list. Volcengine gets BOTH ports; qoder gets
-        # the one configured port. close_browser works for both classes
-        # (it only needs .base / .is_alive / .port).
+        # Build (port, cdp) list. Volcengine: DEFAULT_PORT (headless polling
+        # Chrome) plus LOGIN_PORT (visible login window) -- but LOGIN_PORT
+        # may have been overridden by credentials.cdp_port, and the LOGIN_PORT
+        # login window is actually opened on the user-configured port when
+        # credentials.cdp_port is set. So volcengine always has at most one
+        # port in play; we read it from credentials.
+        # Qoder: single port from credentials.
         targets: list[tuple[int, object]] = []
         for p in _app_config.get("providers", []):
             ptype = p.get("type", "")
+            creds = p.get("credentials", {})
             if ptype == "volcengine":
-                targets.append((VLOGIN, VolcengineCdp(VLOGIN)))
-                targets.append((VDFLT, VolcengineCdp(VDFLT)))
+                port = int(creds.get("cdp_port", VDFLT))
+                targets.append((port, VolcengineCdp(port)))
             elif ptype == "qoder":
-                port = int(p.get("credentials", {}).get("cdp_port", 9333))
+                port = int(creds.get("cdp_port", 9333))
                 targets.append((port, QoderCdp(port)))
 
         for port, cdp in targets:
@@ -2783,6 +2779,74 @@ class MonitorApp:
                     _log.warning(f"Chrome on port {port} did not exit in time")
             except Exception as e:
                 _log.warning(f"cleanup error for port {port}: {e}")
+
+        # Hard-kill safety net: enumerate all chrome.exe processes whose
+        # --user-data-dir points at our profile dirs. Catches orphans the
+        # per-port loop missed:
+        #   1. Chrome opened by a provider the user removed mid-session
+        #   2. Chrome on a port not yet known to config (race during start)
+        #   3. Chrome that ignored Browser.close (WS handshake failed, hung
+        #      process, etc.)
+        # Order matters: try CDP graceful close first (flushes profile writes
+        # and releases the user-data-dir singleton lock cleanly), hard-kill
+        # only as a last resort. Hard-killing a mid-write Chrome CAN corrupt
+        # its profile -- that is why we only fall back to it when graceful
+        # close timed out AND the process is still running.
+        try:
+            import psutil
+        except ImportError:
+            return
+        config_dir = _config_dir()
+        # Profile dirs we consider "ours" -- canonical defaults plus any
+        # custom paths from providers that might still have a live Chrome.
+        our_profiles: set[str] = set()
+        # Always include the two canonical defaults; open_login_window uses
+        # them regardless of credentials.cdp_port.
+        from providers.volcengine_cdp import _profile_dir as _vdir
+        from providers.qoder import _profile_dir as _qdir
+        our_profiles.add(str(_vdir()))
+        our_profiles.add(str(_qdir()))
+        for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+            try:
+                if (proc.info.get("name") or "").lower() != "chrome.exe":
+                    continue
+                cmd = proc.info.get("cmdline") or []
+                udd = None
+                port = None
+                for arg in cmd:
+                    if arg.startswith("--user-data-dir="):
+                        udd = arg.split("=", 1)[1]
+                    elif arg.startswith("--remote-debugging-port="):
+                        try:
+                            port = int(arg.split("=", 1)[1])
+                        except ValueError:
+                            pass
+                if not udd or not any(
+                    Path(udd).resolve() == Path(p).resolve() for p in our_profiles
+                ):
+                    continue
+                _log.warning(f"orphan Chrome found: pid={proc.pid} "
+                             f"port={port} profile={udd}")
+                graceful_ok = False
+                if port is not None:
+                    try:
+                        # Use VolcengineCdp for the CDP call -- it only needs
+                        # .base / .is_alive / .port which both classes share.
+                        cdp = VolcengineCdp(port)
+                        graceful_ok = close_browser(cdp, settle=0.0)
+                    except Exception as e:
+                        _log.warning(f"orphan graceful close failed: {e}")
+                if not graceful_ok and proc.is_running():
+                    _log.warning(f"hard-killing orphan Chrome pid={proc.pid}")
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=2)
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+            except Exception as e:
+                _log.warning(f"orphan cleanup error: {e}")
 
 
 def main():

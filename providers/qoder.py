@@ -298,7 +298,7 @@ def open_login_window(port: int = DEFAULT_PORT) -> None:
     if not exe:
         raise RuntimeError("未找到 Chrome/Edge")
     if cdp.is_alive():
-        _close_browser(cdp)
+        close_browser(cdp)
     subprocess.Popen(
         [
             exe,
@@ -318,11 +318,29 @@ def open_login_window(port: int = DEFAULT_PORT) -> None:
     raise RuntimeError("登录窗口启动超时")
 
 
-def _close_browser(cdp: QoderCdp) -> None:
+def close_browser(cdp: QoderCdp, settle: float = 0.8) -> bool:
     """Gracefully close the Chrome owning the debug port via CDP.
 
-    Browser.close makes Chrome flush cookies to disk before exiting, which
-    matters when a login just happened in a visible window.
+    Mirrors providers.volcengine_cdp.close_browser so the two providers have
+    the same auto-close contract: Browser.close flushes the cookie profile
+    to disk before the process dies (matters when a login just happened in
+    a visible window), and we wait for the port to free up before the
+    caller respawns on the same user-data-dir.
+
+    Returns True if the Chrome is gone (and the caller can respawn). Callers
+    that need the profile lock treat False as "retry later" instead of
+    spawning a new Chrome that would forward to the zombie and time out.
+
+    ``settle``: grace period AFTER the port dies but BEFORE the caller may
+    respawn on the same profile. The port dying does not mean the process
+    is gone -- it may still be releasing the user-data-dir singleton lock
+    and flushing the last cookie writes. A Chrome spawned in that window
+    forwards its command line to the dying process and exits, so its debug
+    port never opens (the "spawn timeout" failure). Pass settle=0 only for
+    teardown (app quit), never before a respawn.
+
+    NOTE: can wait up to ~10s for the port to free up, so only call from
+    a background thread -- never from the UI thread.
     """
     try:
         info = requests.get(f"{cdp.base}/json/version", timeout=5).json()
@@ -334,11 +352,16 @@ def _close_browser(cdp: QoderCdp) -> None:
                 ws.send(json.dumps({"id": 1, "method": "Browser.close"}))
     except Exception:
         pass
-    # Wait for the port to actually free up before relaunching.
-    for _ in range(50):
-        if not cdp.is_alive():
-            return
+    # Wait for the port to actually free up before relaunching. Short
+    # liveness timeout -- a long one explodes this loop's wall-clock time
+    # on machines where loopback connect() is slow to raise.
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if not cdp.is_alive(timeout=0.5):
+            time.sleep(settle)
+            return True
         time.sleep(0.2)
+    return False
 
 
 @register_provider
@@ -348,6 +371,14 @@ class QoderProvider(ProviderBase):
     def fetch(self) -> ProviderSnapshot:
         port = int(self.credentials.get("cdp_port", DEFAULT_PORT))
         cdp = QoderCdp(port)
+        # If a Chrome is already alive on this port it's the visible login
+        # window (open_login_window killed the headless one before launching
+        # visible). Close it before spawning headless so the user isn't staring
+        # at a Chrome window we just stole focus onto, and so eval_fetch's
+        # navigation doesn't yank focus to whatever tab is foreground.
+        # Mirrors VolcengineProvider._fetch_locked's LOGIN_PORT pattern.
+        if cdp.is_alive(timeout=0.5):
+            close_browser(cdp)
         cdp.spawn(headless=True)
         results = cdp.eval_fetch()
         if not results:
