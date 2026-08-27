@@ -1395,7 +1395,11 @@ class SettingsDialog(QDialog):
         """Switch the stacked page and update nav button checked states."""
         self._commit_editor()
         self._editing_index = None
-        self.list_widget.clearSelection()
+        # clearSelection() alone leaves currentIndex intact, so re-clicking
+        # the previously-current provider row would not emit
+        # currentRowChanged and the page would never switch back. Reset the
+        # current row too (guarded row<0 in _on_select_row makes this safe).
+        self.list_widget.setCurrentRow(-1)
         for i, btn in enumerate(self._nav_btns):
             btn.setChecked(i + 1 == idx)
         self.stack.setCurrentIndex(idx)

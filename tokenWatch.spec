@@ -5,7 +5,10 @@ a = Analysis(
     ['monitor.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    # _resource_dir() resolves to _MEIPASS when frozen, so icon/ and image/
+    # must be bundled: 下拉.png (QComboBox down-arrow via QSS), 删除.png
+    # (provider row delete button), cpw_icon.ico (window icon).
+    datas=[('icon', 'icon'), ('image', 'image')],
     hiddenimports=['psutil'],
     hookspath=[],
     hooksconfig={},
